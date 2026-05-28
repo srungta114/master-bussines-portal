@@ -14,14 +14,13 @@ def check_password():
         pwd = st.text_input("Password", type="password")
         
         if st.button("Login"):
-            if pwd == "admin123": # Change to your actual password
+            # Now it checks the secret vault instead of hardcoded text!
+            if pwd == st.secrets["master_password"]: 
                 st.session_state["password_correct"] = True
                 st.rerun()
             else:
                 st.error("❌ Incorrect Password")
-        st.stop() # Stops the rest of the app from loading until logged in
-
-check_password()
+        st.stop()
 
 # 3. If password is correct, setup the Navigation Menu
 st.title("🏢 Master Business Portal")
