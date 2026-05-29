@@ -819,7 +819,7 @@ with tab2:
                                         group_val = item_details['Group']
                                         sales_unit = item_details['Sales_Unit']
                                         
-                                        original_qty = float(df_upload[df_upload[1].astype(str).str.strip() == orig_row['Bill Number']].iloc[0][2])
+                                        original_qty = float(st.session_state.raw_upload_data[st.session_state.raw_upload_data[1].astype(str).str.strip() == orig_row['Bill Number']].iloc[0][2])
                                         stock_qty_added = abs(original_qty) * qty_multiplier
                                         
                                         pur_qty = abs(original_qty) if bulk_type in ["Purchases", "Purchase Returns"] else 0
