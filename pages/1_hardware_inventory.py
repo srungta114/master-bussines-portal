@@ -1,10 +1,26 @@
 import streamlit as st
-from streamlit_gsheets import GSheetsConnection
 import pandas as pd
+import gspread
+from google.oauth2.service_account import Credentials
 from datetime import datetime
 from difflib import get_close_matches
 import re
 import io
+
+# --- SECURE CREDENTIALS & AUTHENTICATION ---
+gsheet_creds = st.secrets["gsheets"]
+
+try:
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(gsheet_creds, scopes=scopes)
+    client = gspread.authorize(creds)
+    
+    # Connects exactly to your new Inventory Database
+    SHEET_ID = "1I3A79zVuSg4Gy98EgUfktYLEzJtXUc6vynSobGl2rFQ"
+    sh = client.open_by_key(SHEET_ID)
+except Exception as e:
+    st.error(f"Authentication Failed: {e}")
+    st.stop()
 
 # --- NEPALI FISCAL YEAR ENGINE (DYNAMIC) ---
 def get_nepali_fiscal_year(date_val):
@@ -21,24 +37,11 @@ def get_nepali_fiscal_year(date_val):
             return "Unknown"
             
         year = d.year
-        
-        # Dynamic Mapping: Exact start dates (July) of Shrawan 1 for specific Gregorian years.
-        # This accounts for the fluctuation of Shrawan 1 between July 15, 16, and 17.
         shrawan_1_dates = {
-            2020: 16,
-            2021: 16,
-            2022: 17,
-            2023: 17,
-            2024: 16,
-            2025: 16,
-            2026: 16,
-            2027: 17,
-            2028: 16,
-            2029: 16,
-            2030: 17
+            2020: 16, 2021: 16, 2022: 17, 2023: 17,
+            2024: 16, 2025: 16, 2026: 16, 2027: 17,
+            2028: 16, 2029: 16, 2030: 17
         }
-        
-        # Default to 16 if the year is not explicitly in our mapping table
         cutoff_day = shrawan_1_dates.get(year, 16)
 
         if d.month > 7 or (d.month == 7 and d.day >= cutoff_day):
@@ -46,44 +49,108 @@ def get_nepali_fiscal_year(date_val):
         else:
             bs_year = year + 56
         
-        return f"FY {bs_year}/{str(bs_year + 1)[-2:]}"
+        return f"FY {bs_year}-{str(bs_year + 1)[-2:]}"
     except:
         return "Unknown"
 
-# --- CONNECT TO GOOGLE SHEETS ---
-conn = st.connection("gsheets", type=GSheetsConnection)
-
-# --- HELPER TO FORCE FORMATS AND AUTO-CALCULATE FISCAL YEAR ON SAVES ---
-def save_purchases(df_to_save):
-    df_save = df_to_save.copy()
-    if 'Date' in df_save.columns:
-        df_save['Date'] = pd.to_datetime(df_save['Date'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
-        # Automatically enforce and generate Nepali Fiscal Year on every database save
-        df_save['Fiscal Year'] = df_save['Date'].apply(get_nepali_fiscal_year)
-    conn.update(worksheet="Purchases", data=df_save)
-
+# --- GOOGLE SHEETS DYNAMIC READ/WRITE FUNCTIONS ---
 @st.cache_data(ttl=10)
 def get_product_master():
-    return conn.read(worksheet="Product_Master")
+    try:
+        records = sh.worksheet("Product_Master").get_all_records()
+        return pd.DataFrame(records)
+    except Exception:
+        return pd.DataFrame(columns=["Item_Name", "Purchase_Unit", "Sales_Unit", "Group"])
 
 @st.cache_data(ttl=10)
 def get_purchases():
-    return conn.read(worksheet="Purchases")
+    try:
+        all_records = []
+        # Read from all Fiscal Year tabs
+        for ws in sh.worksheets():
+            if ws.title.startswith("FY "):
+                all_records.extend(ws.get_all_records())
+                
+        # Also read the old "Purchases" tab so you don't lose old data during migration
+        try:
+            old_ws = sh.worksheet("Purchases")
+            all_records.extend(old_ws.get_all_records())
+        except Exception:
+            pass
+            
+        return pd.DataFrame(all_records) if all_records else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
 
 @st.cache_data(ttl=10)
 def get_code_mapping():
     try:
-        return conn.read(worksheet="Code_Mapping")
-    except:
+        records = sh.worksheet("Code_Mapping").get_all_records()
+        return pd.DataFrame(records)
+    except Exception:
         return pd.DataFrame(columns=["Item Code", "Item Name", "Units"])
 
 @st.cache_data(ttl=10)
 def get_learned_mappings():
     try:
-        return conn.read(worksheet="Learned_Mappings")
-    except:
+        records = sh.worksheet("Learned_Mappings").get_all_records()
+        return pd.DataFrame(records)
+    except Exception:
         return pd.DataFrame(columns=["Billed_Description", "Matched_Item_Name"])
 
+def save_purchases(df_to_save):
+    if df_to_save.empty:
+        return
+
+    df_save = df_to_save.copy()
+    if 'Date' in df_save.columns:
+        df_save['Date'] = pd.to_datetime(df_save['Date'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
+        df_save['Fiscal Year'] = df_save['Date'].apply(get_nepali_fiscal_year)
+    
+    if 'Fiscal Year' in df_save.columns:
+        existing_ws = {ws.title: ws for ws in sh.worksheets() if ws.title.startswith("FY ")}
+        processed_tabs = set()
+        
+        # 1. Group data by Fiscal Year and route to different tabs
+        for fy, group_df in df_save.groupby('Fiscal Year'):
+            ws_name = str(fy).replace("/", "-") if pd.notna(fy) and str(fy).strip() != "Unknown" else "FY Unknown"
+            if not ws_name.startswith("FY "): 
+                ws_name = "FY " + ws_name
+                
+            processed_tabs.add(ws_name)
+            
+            # Create the tab automatically if it doesn't exist
+            if ws_name in existing_ws:
+                ws = existing_ws[ws_name]
+            else:
+                ws = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
+            
+            # Write data to the specific FY tab
+            group_df = group_df.fillna("")
+            data_to_write = [group_df.columns.values.tolist()] + group_df.values.tolist()
+            ws.clear()
+            ws.update(values=data_to_write, range_name="A1")
+            
+        # 2. Clear out the old 'Purchases' tab so it doesn't duplicate data
+        try:
+            old_ws = sh.worksheet("Purchases")
+            old_ws.clear()
+        except Exception:
+            pass
+
+def save_learned_mappings(df_to_save):
+    try:
+        ws = sh.worksheet("Learned_Mappings")
+    except Exception:
+        ws = sh.add_worksheet(title="Learned_Mappings", rows="1000", cols="5")
+    
+    df_to_save = df_to_save.fillna("")
+    data_to_write = [df_to_save.columns.values.tolist()] + df_to_save.values.tolist()
+    ws.clear()
+    ws.update(values=data_to_write, range_name="A1")
+
+# Initialization
+products_df = get_product_master()
 products_df = get_product_master()
 purchases_df = get_purchases()
 
@@ -718,7 +785,7 @@ with tab2:
                         updated_learnings = pd.concat([learned_df, new_rules_df], ignore_index=True)
                         updated_learnings['Billed_Description'] = updated_learnings['Billed_Description'].astype(str).str.strip().str.upper()
                         updated_learnings = updated_learnings.drop_duplicates(subset=["Billed_Description"], keep="last")
-                        conn.update(worksheet="Learned_Mappings", data=updated_learnings)
+                        save_learned_mappings(updated_learnings)
                     
                     st.cache_data.clear()
                     st.session_state.committed_file_name = st.session_state.processed_file_name
@@ -998,7 +1065,7 @@ with tab4:
             clean_df = learned_df.copy()
             clean_df['Billed_Description'] = clean_df['Billed_Description'].astype(str).str.strip().str.upper()
             clean_df = clean_df.drop_duplicates(subset=["Billed_Description"], keep="last")
-            conn.update(worksheet="Learned_Mappings", data=clean_df)
+            save_learned_mappings(clean_df)
             st.cache_data.clear()
             st.success("✅ AI Memory Optimized! All duplicate formatting variations have been removed.")
             st.rerun()
