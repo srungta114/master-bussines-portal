@@ -3,10 +3,12 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- 2. SECURE DATA LOADERS ---
+# --- 2. SECURE DATA LOADERS (USING SESSION STATE) ---
 @st.cache_data(ttl=60)
 def load_products():
     try:
+        # Pull the master connection created by the main_app.py
+        sh = st.session_state.sh
         worksheet = sh.worksheet("Product_Master")
         df = pd.DataFrame(worksheet.get_all_records())
         df.columns = df.columns.str.strip()
@@ -18,6 +20,8 @@ def load_products():
 @st.cache_data(ttl=60)
 def load_purchases_data():
     try:
+        # Pull the master connection created by the main_app.py
+        sh = st.session_state.sh
         purchases_sheet = sh.worksheet("Purchases")
         return pd.DataFrame(purchases_sheet.get_all_records())
     except Exception:
