@@ -168,7 +168,6 @@ def save_learned_mappings(df_to_save):
 
 # Initialization
 products_df = get_product_master()
-products_df = get_product_master()
 purchases_df = get_purchases()
 
 # Dynamically apply Fiscal Year to active session data if it's an older database version
@@ -283,12 +282,6 @@ def normalize_text(text):
         
     return " ".join(t.split())
 
-elif trans_type == "Opening Stock":
-            bill_number = "OPENING-STOCK"
-            st.info("Transaction will be securely recorded as OPENING-STOCK.")
-            opening_fy_input = st.text_input("Target Fiscal Year", value="FY 2082-83", help="Specify which fiscal year this stock belongs to.")
-        else:
-            opening_fy_input = None
 
 # --- REWORKED AI LOGIC WITH DUAL-NORMALIZATION ---
 def find_best_match(description, mapped_keywords=""):
@@ -465,7 +458,7 @@ with tab1:
     
     trans_type = st.radio(
         "Select Transaction Type", 
-        ["Purchase", "Sales", "Purchase Return", "Sales Return", "Stock Adjustment"], 
+        ["Purchase", "Sales", "Purchase Return", "Sales Return", "Opening Stock", "Stock Adjustment"], 
         horizontal=True
     )
     
@@ -483,12 +476,18 @@ with tab1:
             bill_number = st.text_input("Reference / Reason (Optional)", placeholder="E.g., Physical Audit, Damage...")
             if not bill_number:
                 bill_number = f"ADJ-{datetime.now().strftime('%Y%m%d%H%M')}"
+            opening_fy_input = None
+        elif trans_type == "Opening Stock":
+            bill_number = "OPENING-STOCK"
+            st.info("Transaction will be securely recorded as OPENING-STOCK.")
+            opening_fy_input = st.text_input("Target Fiscal Year", value="FY 2082-83", help="Specify which fiscal year this stock belongs to.")
         else:
             bill_number = st.text_input("Bill / Invoice Number", placeholder="Enter Bill Number...")
+            opening_fy_input = None
             
         bill_exists = False
         override_duplicate = True
-        if bill_number and trans_type != "Stock Adjustment" and not purchases_df.empty and str(bill_number).strip() in purchases_df['Bill Number'].astype(str).str.strip().values:
+        if bill_number and trans_type not in ["Stock Adjustment", "Opening Stock"] and not purchases_df.empty and str(bill_number).strip() in purchases_df['Bill Number'].astype(str).str.strip().values:
             bill_exists = True
             st.error(f"🚨 Bill Number '{bill_number}' already exists.")
             override_duplicate = st.checkbox("I intentionally want to APPEND to this existing bill.")
@@ -529,18 +528,24 @@ with tab1:
             elif trans_type == "Stock Adjustment":
                 stock_qty = st.number_input(f"Stock Adjustment Quantity ({s_unit})", step=1.0, value=None, help="Use positive numbers to ADD stock, negative to DEDUCT stock.")
                 billed_qty = 0
+                
+            elif trans_type == "Opening Stock":
+                stock_qty = st.number_input(f"Opening Stock Quantity ({s_unit})", min_value=0.01, step=1.0, value=None)
+                billed_qty = 0
             
             if st.form_submit_button("➕ Add Item to Cart", type="primary"):
                 if trans_type == "Stock Adjustment" and (stock_qty is None or stock_qty == 0):
                     st.error("Please enter a non-zero adjustment quantity.")
-                elif trans_type != "Stock Adjustment" and not billed_qty:
+                elif trans_type == "Opening Stock" and not stock_qty:
+                    st.error("Please enter the Opening Stock quantity.")
+                elif trans_type not in ["Stock Adjustment", "Opening Stock"] and not billed_qty:
                     st.error("Please enter the Billed Quantity.")
                 elif trans_type in ["Purchase", "Purchase Return"] and p_unit != s_unit and not stock_qty:
                     st.error(f"Please enter the Actual Stock Impact in {s_unit}.")
                 else:
                     if trans_type in ["Sales", "Purchase Return"]:
                         final_stock = -abs(stock_qty)
-                    elif trans_type in ["Purchase", "Sales Return"]:
+                    elif trans_type in ["Purchase", "Sales Return", "Opening Stock"]:
                         final_stock = abs(stock_qty)
                     elif trans_type == "Stock Adjustment":
                         final_stock = stock_qty  
@@ -568,7 +573,7 @@ with tab1:
         c_sub, c_clr = st.columns([2, 1])
         with c_sub:
             if st.button("💾 Commit Transaction to Database", type="primary", use_container_width=True):
-                if trans_type != "Stock Adjustment" and not bill_number:
+                if trans_type not in ["Stock Adjustment", "Opening Stock"] and not bill_number:
                     st.error("Please enter a Bill Number at the top.")
                 elif bill_exists and not override_duplicate:
                     st.error("Duplicate Bill detected. Please check the override box above to proceed.")
