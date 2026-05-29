@@ -3,503 +3,488 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
-# --- 1. SECURE CREDENTIALS & AUTHENTICATION ---
-# Pull the secrets securely from Streamlit's vault
-gsheet_creds = st.secrets["gsheets"]
-
-try:
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_info(gsheet_creds, scopes=scopes)
-    client = gspread.authorize(creds)
-    SHEET_ID = "1ZTI3G97SSOcowXJyHpncFFSlGyS5VSLJublqLpAxVIk"
-    sh = client.open_by_key(SHEET_ID)
-except Exception as e:
-    st.error(f"Authentication Failed: {e}")
-    st.stop()
-
-
-# --- 2. FETCH DATA FROM GOOGLE SHEETS ---
-@st.cache_data(ttl=60)  
-def load_data():
+# --- 2. SECURE DATA LOADERS ---
+@st.cache_data(ttl=60)
+def load_products():
     try:
-        raw_materials_sheet = sh.worksheet("Raw_Materials")
-        transport_sheet = sh.worksheet("Transport_Rates")
-        hardware_sheet = sh.worksheet("Hardware_Rates")
-        exchange_sheet = sh.worksheet("Exchange_Rates")
-
-        rm_df = pd.DataFrame(raw_materials_sheet.get_all_records())
-        tr_df = pd.DataFrame(transport_sheet.get_all_records())
-        hw_df = pd.DataFrame(hardware_sheet.get_all_records())
-        ex_df = pd.DataFrame(exchange_sheet.get_all_records())
-
-        for df in [rm_df, tr_df, hw_df, ex_df]:
-            df.columns = df.columns.str.strip()
-
-        return rm_df, tr_df, hw_df, ex_df
+        worksheet = sh.worksheet("Product_Master")
+        df = pd.DataFrame(worksheet.get_all_records())
+        df.columns = df.columns.str.strip()
+        return df
     except Exception as e:
-        st.error(f"Failed to load data: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        st.error(f"Failed to load Product Master: {e}")
+        return pd.DataFrame()
 
-# Load datasets
-rm_df, tr_df, hw_df, ex_df = load_data()
+@st.cache_data(ttl=60)
+def load_purchases_data():
+    try:
+        purchases_sheet = sh.worksheet("Purchases")
+        return pd.DataFrame(purchases_sheet.get_all_records())
+    except Exception:
+        return pd.DataFrame() 
+
+df_master = load_products()
+df_purchases = load_purchases_data()
+
+# Extract unique sellers
+if not df_purchases.empty and 'Seller' in df_purchases.columns:
+    existing_sellers = sorted([str(s).strip() for s in df_purchases['Seller'].dropna().unique() if str(s).strip() != ""])
+else:
+    existing_sellers = []
+
+# Initialize Session State
+if 'bill_items' not in st.session_state:
+    st.session_state.bill_items = []
+
+st.title("🏗️ Material & Inventory Ledger")
 
 
-# --- 3. HELPER FUNCTIONS ---
-def get_latest_rate(df, key_col, value_col, key_val):
-    if df.empty or key_col not in df.columns or value_col not in df.columns:
-        return 0.0
-    match = df[df[key_col].astype(str).str.strip().str.lower() == str(key_val).strip().lower()]
-    return float(match.iloc[-1][value_col]) if not match.empty else 0.0
-
-def format_inr(val):
-    return f"₹{val:,.2f}"
-
-def format_npr(val):
-    return f"रू{val:,.2f}"
-
-
-# --- 4. STREAMLIT UI ---
-st.title("🏭 Material Costing & Purchase Ledger")
-
-tab1, tab2, tab3 = st.tabs(["🧮 Material Costing Calculator", "📦 Record Purchase (Ledger)", "📊 View Ledger & Live Stock"])
-
-# ==========================================
-# TAB 1: MATERIAL COSTING CALCULATOR
-# ==========================================
-with tab1:
-    st.header("Calculate Landed Cost")
-
-    # Inputs Layout
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.subheader("1. Material Details")
-        material_options = rm_df['Material_Name'].dropna().unique().tolist() if not rm_df.empty else ["No materials found"]
-        material = st.selectbox("Select Material", material_options)
-
-        purchase_rate_inr = st.number_input("Purchase Rate (INR)", min_value=0.0, format="%.2f")
-        quantity = st.number_input("Quantity (MT)", min_value=0.01, value=1.0, step=0.1)
-
-    with col2:
-        st.subheader("2. Transport & Duty Options")
+# --- 3. QUICK COSTING SEARCH ---
+st.header("🔍 Quick Costing Search")
+with st.expander("Search Master Database", expanded=False): 
+    if not df_purchases.empty and 'Material' in df_purchases.columns:
+        search_materials = sorted(df_purchases['Material'].dropna().unique().tolist())
         
-        transport_options = tr_df['Route'].dropna().unique().tolist() if not tr_df.empty else ["No routes found"]
-        route = st.selectbox("Select Transport Route", transport_options)
+        # SMART PLACEHOLDER SEARCH
+        search_selection = st.selectbox(
+            "Search Database", 
+            options=search_materials, 
+            index=None, 
+            placeholder="Type or click here to search for a material..."
+        )
         
-        transport_rate_inr = get_latest_rate(tr_df, 'Route', 'Rate_INR', route)
-        st.info(f"Transport Rate: **{format_inr(transport_rate_inr)} / MT**")
-
-        hardware_options = hw_df['Supplier'].dropna().unique().tolist() if not hw_df.empty else ["No suppliers found"]
-        hardware = st.selectbox("Select Hardware Rates", hardware_options)
-        
-        clearing_charge_inr = get_latest_rate(hw_df, 'Supplier', 'Clearing_Charge_INR', hardware)
-        custom_duty_pct = get_latest_rate(hw_df, 'Supplier', 'Custom_Duty_Pct', hardware)
-        loading_unloading_inr = get_latest_rate(hw_df, 'Supplier', 'Loading_Unloading_INR', hardware)
-        
-        st.caption(f"Clearing: {format_inr(clearing_charge_inr)}/MT | Duty: {custom_duty_pct}% | Load/Unload: {format_inr(loading_unloading_inr)}/MT")
-
-        if not ex_df.empty and 'Exchange_Rate' in ex_df.columns:
-            exchange_rate = float(ex_df['Exchange_Rate'].iloc[-1])
-        else:
-            exchange_rate = 1.6  # Default fallback
-        st.write(f"💱 **Current Exchange Rate:** 1 INR = **{exchange_rate} NPR**")
-
-    st.divider()
-
-    # Calculation Execution
-    if st.button("Calculate Landed Cost", type="primary"):
-        if purchase_rate_inr <= 0:
-            st.warning("Please enter a valid Purchase Rate.")
-        else:
-            # Step 1: Base Costs (INR)
-            base_cost_inr = purchase_rate_inr * quantity
-            total_transport_inr = transport_rate_inr * quantity
-            total_clearing_inr = clearing_charge_inr * quantity
-            total_loading_inr = loading_unloading_inr * quantity
+        if search_selection:
+            item_data = df_purchases[df_purchases['Material'] == search_selection].iloc[-1]
             
-            # Step 2: Convert to NPR BEFORE Duty
-            base_cost_npr = base_cost_inr * exchange_rate
-            total_transport_npr = total_transport_inr * exchange_rate
-            total_clearing_npr = total_clearing_inr * exchange_rate
-            total_loading_npr = total_loading_inr * exchange_rate
+            st.info(f"**Supplier:** {item_data.get('Seller', 'N/A')} | **Bill No:** {item_data.get('Bill_No', 'N/A')} | **Date:** {item_data.get('Date', 'N/A')}")
             
-            # Assessable Value for Custom Duty (Material + Transport in NPR)
-            assessable_value_npr = base_cost_npr + total_transport_npr
+            # Math & Parsing
+            landed_rate = float(item_data.get('Landed_Rate_Purchase', 0))
+            true_pre_tax_purchase = landed_rate / 1.13
+            cost_pc = float(item_data.get('Cost_Pc', 0))
             
-            # Step 3: Custom Duty Calculation (NPR)
-            custom_duty_npr = assessable_value_npr * (custom_duty_pct / 100)
+            purch_unit = str(item_data.get('Unit_Purchase', '')).strip()
+            sales_unit = str(item_data.get('Unit_Sales', '')).strip()
+            qty_p = float(item_data.get('Qty_Purchase', 0))
+            qty_s = float(item_data.get('Qty_Sales', 1)) 
             
-            # Step 4: Total Landed Cost (NPR)
-            total_landed_cost_npr = (
-                base_cost_npr + 
-                total_transport_npr + 
-                total_clearing_npr + 
-                custom_duty_npr + 
-                total_loading_npr
-            )
+            is_pcs = sales_unit.lower() in ['pcs', 'pc', 'piece', 'pieces']
+            is_kg = purch_unit.lower() in ['kg', 'kgs', 'kilogram', 'kilograms']
             
-            landed_cost_per_mt_npr = total_landed_cost_npr / quantity
-            landed_cost_per_kg_npr = landed_cost_per_mt_npr / 1000
-
-            # Store result in session state to pass to Tab 2
-            st.session_state['last_calc'] = {
-                'Material': material,
-                'Quantity': quantity,
-                'Landed_Cost_Per_MT': landed_cost_per_mt_npr,
-                'Landed_Cost_Per_KG': landed_cost_per_kg_npr,
-                'Total_Landed_Cost': total_landed_cost_npr
-            }
-
-            # Results Display
-            st.subheader("🧾 Cost Breakdown")
+            # Row 1
+            r1_c1, r1_c2, r1_c3 = st.columns(3)
+            r1_c1.metric("Landed Cost (Purchase Unit)", f"{landed_rate:.2f} / {purch_unit}")
+            r1_c2.metric("Cost per Sales Unit", f"{cost_pc:.2f} / {sales_unit}")
+            r1_c3.metric("Last Qty Bought", f"{qty_p} {purch_unit}")
             
-            res_col1, res_col2, res_col3 = st.columns(3)
+            st.write("") 
             
-            with res_col1:
-                st.write("**Base Costs (INR)**")
-                st.write(f"Material: {format_inr(base_cost_inr)}")
-                st.write(f"Transport: {format_inr(total_transport_inr)}")
-                st.write(f"Clearing: {format_inr(total_clearing_inr)}")
-                st.write(f"Load/Unload: {format_inr(total_loading_inr)}")
-                st.write(f"**Total INR:** {format_inr(base_cost_inr + total_transport_inr + total_clearing_inr + total_loading_inr)}")
-
-            with res_col2:
-                st.write("**Converted Costs (NPR)**")
-                st.write(f"Material: {format_npr(base_cost_npr)}")
-                st.write(f"Transport: {format_npr(total_transport_npr)}")
-                st.write(f"Assessable Value: {format_npr(assessable_value_npr)}")
-                st.write(f"Custom Duty ({custom_duty_pct}%): {format_npr(custom_duty_npr)}")
-                st.write(f"Other Charges: {format_npr(total_clearing_npr + total_loading_npr)}")
-
-            with res_col3:
-                st.success("### Final Landed Cost")
-                st.write(f"Total Cost: **{format_npr(total_landed_cost_npr)}**")
-                st.write(f"Cost per MT: **{format_npr(landed_cost_per_mt_npr)}**")
-                st.write(f"Cost per KG: **{format_npr(landed_cost_per_kg_npr)}**")
+            # Row 2
+            row_2_metrics = []
+            row_2_metrics.append(("Pre-Tax (Purchase Unit)", f"{true_pre_tax_purchase:.2f}"))
+            
+            if is_pcs:
+                pre_tax_pc = cost_pc / 1.13
+                row_2_metrics.append(("Pre-Tax (Sales Unit)", f"{pre_tax_pc:.2f} / {sales_unit}"))
                 
-            st.info("💡 Go to the **'Record Purchase'** tab to save this calculation to the ledger.")
-
-
-# ==========================================
-# TAB 2: RECORD PURCHASE (LEDGER)
-# ==========================================
-with tab2:
-    st.header("Save Purchase to Ledger")
-    
-    if 'last_calc' not in st.session_state:
-        st.warning("⚠️ No recent calculation found. Please run a calculation in the first tab.")
+            if is_pcs and is_kg and qty_s > 0:
+                weight_per_pc = qty_p / qty_s
+                row_2_metrics.append(("Weight per Piece", f"{weight_per_pc:.3f} {purch_unit}"))
+                
+            r2_cols = st.columns(len(row_2_metrics))
+            for idx, (label, value) in enumerate(row_2_metrics):
+                r2_cols[idx].metric(label, value)
+                
     else:
-        calc = st.session_state['last_calc']
-        st.success(f"Ready to record: **{calc['Quantity']} MT** of **{calc['Material']}** at **{format_npr(calc['Landed_Cost_Per_KG'])}/KG**")
-        
-        with st.form("ledger_form"):
-            date = st.date_input("Purchase Date")
-            supplier = st.text_input("Supplier Name")
-            invoice_no = st.text_input("Invoice / LC Number")
-            
-            submitted = st.form_submit_button("Save to Ledger")
-            
-            if submitted:
-                if not supplier or not invoice_no:
-                    st.error("Please fill in Supplier Name and Invoice Number.")
-                else:
-                    try:
-                        purchases_sheet = sh.worksheet("Purchases")
-                        
-                        # 1. GET EXISTING DATA
-                        existing_data = purchases_sheet.get_all_records()
-                        df_existing = pd.DataFrame(existing_data)
-                        
-                        # Fix column names to match exactly
-                        expected_columns = ["Date", "Invoice_No", "Supplier", "Material", "Quantity_MT", "Landed_Cost_Per_KG", "Total_Cost_NPR", "Is_Blended"]
-                        
-                        if not df_existing.empty:
-                            df_existing = df_existing[[col for col in expected_columns if col in df_existing.columns]]
-                            
-                            # Safely convert Quantity_MT to numeric, coercing errors to 0
-                            df_existing['Quantity_MT'] = pd.to_numeric(df_existing['Quantity_MT'], errors='coerce').fillna(0)
-                        
-                        # Extract parameters for the NEW purchase
-                        new_qty = float(calc['Quantity'])
-                        new_cost_per_kg = float(calc['Landed_Cost_Per_KG'])
-                        new_total = new_qty * 1000 * new_cost_per_kg
-                        
-                        # Create the new standard row
-                        new_row = pd.DataFrame([{
-                            "Date": date.strftime("%Y-%m-%d"),
-                            "Invoice_No": invoice_no,
-                            "Supplier": supplier,
-                            "Material": calc['Material'],
-                            "Quantity_MT": new_qty,
-                            "Landed_Cost_Per_KG": new_cost_per_kg,
-                            "Total_Cost_NPR": new_total,
-                            "Is_Blended": "No"
-                        }])
-                        
-                        rows_to_add = [new_row]
-                        
-                        # --- BLENDED COST LOGIC ---
-                        if not df_existing.empty:
-                            # Filter for the exact same material
-                            mat_history = df_existing[df_existing['Material'] == calc['Material']]
-                            
-                            if not mat_history.empty:
-                                # Get the absolute latest entry for this material (which represents current stock)
-                                latest_entry = mat_history.iloc[-1]
-                                old_qty = float(latest_entry.get('Quantity_MT', 0))
-                                
-                                # If there is remaining stock, blend it!
-                                if old_qty > 0:
-                                    old_cost_per_kg = float(latest_entry.get('Landed_Cost_Per_KG', 0))
-                                    old_total = old_qty * 1000 * old_cost_per_kg
-                                    
-                                    # Blend Math
-                                    blended_qty = old_qty + new_qty
-                                    blended_total = old_total + new_total
-                                    blended_cost_per_kg = blended_total / (blended_qty * 1000)
-                                    
-                                    blended_row = pd.DataFrame([{
-                                        "Date": date.strftime("%Y-%m-%d"),
-                                        "Invoice_No": "BLENDED-STOCK",
-                                        "Supplier": "System Generated",
-                                        "Material": calc['Material'],
-                                        "Quantity_MT": round(blended_qty, 3),
-                                        "Landed_Cost_Per_KG": round(blended_cost_per_kg, 2),
-                                        "Total_Cost_NPR": round(blended_total, 2),
-                                        "Is_Blended": "Yes"
-                                    }])
-                                    
-                                    rows_to_add.append(blended_row)
-                        
-                        # 2. COMBINE DATA
-                        df_to_append = pd.concat(rows_to_add, ignore_index=True)
-                        
-                        if not df_existing.empty:
-                            df_combined = pd.concat([df_existing, df_to_append], ignore_index=True)
-                        else:
-                            df_combined = df_to_append
-                            
-                        # 3. CLEAN & SORT
-                        df_combined['Date'] = pd.to_datetime(df_combined['Date'])
-                        df_combined = df_combined.sort_values(by=['Date', 'Is_Blended'], ascending=[True, True])
-                        df_combined['Date'] = df_combined['Date'].dt.strftime('%Y-%m-%d')
-                        
-                        df_combined_clean = df_combined.fillna("")
-                        
-                        # 4. WRITE TO GOOGLE SHEETS
-                        data_to_write = [df_combined_clean.columns.values.tolist()] + df_combined_clean.values.tolist()
-                        purchases_sheet.clear()
-                        purchases_sheet.update(values=data_to_write, range_name="A1")
-                        
-                        st.success(f"✅ Purchase Recorded Successfully! Added {len(rows_to_add)} rows (including blending if applicable).")
-                        del st.session_state['last_calc']  # Clear session state
-                        st.cache_data.clear()  # Clear cache to refresh Ledger tab
-                        
-                    except Exception as e:
-                        st.error(f"Failed to save to Google Sheets: {e}")
-
-
-# ==========================================
-# TAB 3: VIEW LEDGER & LIVE STOCK
-# ==========================================
-with tab3:
-    st.header("Ledger & Live Stock Status")
-    
-    col_a, col_b = st.columns(2)
-    
-    with col_a:
-        st.subheader("📉 Record Usage / Sales")
-        st.write("Deduct material from your inventory when used or sold.")
-        
-        try:
-            p_sheet = sh.worksheet("Purchases")
-            df_ledger = pd.DataFrame(p_sheet.get_all_records())
-            
-            if not df_ledger.empty:
-                df_ledger['Quantity_MT'] = pd.to_numeric(df_ledger['Quantity_MT'], errors='coerce').fillna(0)
-                
-                with st.form("deduct_form"):
-                    deduct_date = st.date_input("Date of Usage")
-                    deduct_mat = st.selectbox("Material Used", df_ledger['Material'].unique())
-                    deduct_qty = st.number_input("Quantity Used (MT)", min_value=0.001, step=0.1)
-                    deduct_reason = st.text_input("Reason / Work Order / Invoice")
-                    
-                    if st.form_submit_button("Deduct Stock", type="primary"):
-                        if not deduct_reason:
-                            st.error("Please provide a Reason or Work Order.")
-                        else:
-                            # 1. Find Current Stock & Blended Cost
-                            mat_history = df_ledger[df_ledger['Material'] == deduct_mat]
-                            latest_entry = mat_history.iloc[-1]
-                            current_qty = float(latest_entry.get('Quantity_MT', 0))
-                            current_cost_per_kg = float(latest_entry.get('Landed_Cost_Per_KG', 0))
-                            
-                            if deduct_qty > current_qty:
-                                st.error(f"Insufficient Stock! You only have {current_qty} MT available.")
-                            else:
-                                # 2. Calculate New Stock
-                                new_qty = current_qty - deduct_qty
-                                new_total = new_qty * 1000 * current_cost_per_kg
-                                
-                                # 3. Create Deduction Row (For Tracking)
-                                deduct_row = pd.DataFrame([{
-                                    "Date": deduct_date.strftime("%Y-%m-%d"),
-                                    "Invoice_No": f"USED: {deduct_reason}",
-                                    "Supplier": "INTERNAL USAGE",
-                                    "Material": deduct_mat,
-                                    "Quantity_MT": -deduct_qty, # Negative to show deduction
-                                    "Landed_Cost_Per_KG": current_cost_per_kg,
-                                    "Total_Cost_NPR": -(deduct_qty * 1000 * current_cost_per_kg),
-                                    "Is_Blended": "Usage"
-                                }])
-                                
-                                # 4. Create New Balance Row
-                                balance_row = pd.DataFrame([{
-                                    "Date": deduct_date.strftime("%Y-%m-%d"),
-                                    "Invoice_No": "BALANCE-FORWARD",
-                                    "Supplier": "System Generated",
-                                    "Material": deduct_mat,
-                                    "Quantity_MT": round(new_qty, 3),
-                                    "Landed_Cost_Per_KG": current_cost_per_kg,
-                                    "Total_Cost_NPR": round(new_total, 2),
-                                    "Is_Blended": "Yes"
-                                }])
-                                
-                                # 5. Save Back to Sheets
-                                df_combined = pd.concat([df_ledger, deduct_row, balance_row], ignore_index=True)
-                                df_combined_clean = df_combined.fillna("")
-                                data_to_write = [df_combined_clean.columns.values.tolist()] + df_combined_clean.values.tolist()
-                                
-                                p_sheet.clear()
-                                p_sheet.update(values=data_to_write, range_name="A1")
-                                
-                                st.success(f"✅ Deducted {deduct_qty} MT! Remaining Stock: {new_qty} MT.")
-                                st.cache_data.clear()
-                                st.rerun()
-            else:
-                st.info("No ledger data available.")
-        except Exception as e:
-            st.error(f"Error loading ledger: {e}")
-
-    with col_b:
-        st.subheader("🏢 Current Live Stock")
-        if not df_ledger.empty:
-            # Group by material and get the LAST entry for each (which is the Blended/Balance row)
-            live_stock = df_ledger.drop_duplicates(subset=['Material'], keep='last').copy()
-            
-            # Format for display
-            live_stock = live_stock[['Material', 'Quantity_MT', 'Landed_Cost_Per_KG', 'Total_Cost_NPR']]
-            live_stock['Landed_Cost_Per_KG'] = live_stock['Landed_Cost_Per_KG'].apply(lambda x: format_npr(x))
-            live_stock['Total_Cost_NPR'] = live_stock['Total_Cost_NPR'].apply(lambda x: format_npr(x))
-            
-            # Filter out zero stock
-            live_stock = live_stock[live_stock['Quantity_MT'] > 0]
-            
-            st.dataframe(live_stock, use_container_width=True, hide_index=True)
-            
-    st.divider()
-    
-    st.subheader("📚 Complete Transaction Ledger")
-    if not df_ledger.empty:
-        # Sort descending to show newest first
-        df_ledger['Date'] = pd.to_datetime(df_ledger['Date'])
-        display_ledger = df_ledger.sort_values(by='Date', ascending=False)
-        display_ledger['Date'] = display_ledger['Date'].dt.strftime('%Y-%m-%d')
-        
-        st.dataframe(display_ledger, use_container_width=True, hide_index=True)
+        st.write("No costings saved yet. Add a bill below to start building your database!")
 
 st.divider()
-st.caption("Upload multiple bill entries in bulk via the Bulk Upload feature (coming soon).")
 
-# --- BULK UPLOAD SALES ---
-st.header("Bulk Upload Sales / Usage (Coming Soon / Existing Feature Integration)")
-uploaded_file = st.file_uploader("Upload Bulk Sales File (CSV/Excel)", type=['csv', 'xlsx'])
-
-if uploaded_file is not None:
-    try:
-        if uploaded_file.name.endswith('.csv'):
-            df_bill = pd.read_csv(uploaded_file)
-        else:
-            df_bill = pd.read_excel(uploaded_file)
-            
-        st.write("Preview of Uploaded File:")
-        st.dataframe(df_bill.head())
+# --- 3.5 EDIT OR DELETE OLD BILLS ---
+st.header("✏️ Edit Old Bills")
+with st.expander("Modify or Delete an existing bill", expanded=False):
+    if not df_purchases.empty and all(col in df_purchases.columns for col in ['Bill_No', 'Seller', 'Date']):
         
-        if st.button("Process Bulk Upload"):
-            # Ensure columns exist, rename/map as needed based on your bulk template
-            if 'Material' not in df_bill.columns or 'Quantity_MT' not in df_bill.columns:
-                st.error("Uploaded file must contain 'Material' and 'Quantity_MT' columns.")
-            else:
-                # Add default ledger tracking columns if missing
-                if 'Date' not in df_bill.columns:
-                    df_bill['Date'] = datetime.now().strftime('%Y-%m-%d')
-                if 'Invoice_No' not in df_bill.columns:
-                    df_bill['Invoice_No'] = "BULK-UPLOAD"
-                if 'Supplier' not in df_bill.columns:
-                    df_bill['Supplier'] = "BULK-USAGE"
-                if 'Is_Blended' not in df_bill.columns:
-                    df_bill['Is_Blended'] = "Usage"
-                
-                # Fetch existing ledger to get current costs
-                purchases_sheet = sh.worksheet("Purchases")
-                df_existing = pd.DataFrame(purchases_sheet.get_all_records())
-                
-                processed_rows = []
-                for _, row in df_bill.iterrows():
-                    mat = row['Material']
-                    qty = float(row['Quantity_MT'])
+        # 1. Create a temporary unique ID combining all three details
+        df_purchases['Unique_Bill_ID'] = df_purchases['Seller'].astype(str) + " | Bill: " + df_purchases['Bill_No'].astype(str) + " | Date: " + df_purchases['Date'].astype(str)
+        
+        # 2. Extract just the unique combinations for the dropdown
+        unique_bill_options = sorted(df_purchases['Unique_Bill_ID'].unique().tolist())
+        
+        edit_selection = st.selectbox(
+            "Search for Bill to Edit (Matches Seller + Bill No + Date)", 
+            options=unique_bill_options, 
+            index=None, 
+            placeholder="Type Seller name, Bill No, or Date..."
+        )
+        
+        if edit_selection:
+            # 3. Filter the master database for JUST this exact combination
+            bill_mask = df_purchases['Unique_Bill_ID'] == edit_selection
+            
+            # 4. Drop the temporary ID column before showing it to the user
+            bill_data = df_purchases[bill_mask].drop(columns=['Unique_Bill_ID']).copy()
+            
+            st.info("Edit the numerical values directly in the table below. The app will automatically recalculate Landed Rates and Totals when you save.")
+            
+            # Show the interactive data editor
+            edited_df = st.data_editor(
+                bill_data, 
+                hide_index=True, 
+                use_container_width=True,
+                disabled=["Seller", "Bill_No", "Date", "Group", "Sub-Group", "Material", "Unit_Purchase", "Unit_Sales"] 
+            )
+            
+            c1, c2 = st.columns(2)
+            
+            # --- SAVE EDITS BUTTON ---
+            if c1.button("💾 Save Changes to Bill"):
+                try:
+                    # Recalculate the Math
+                    base_rate = edited_df['Rate_Purchase'].astype(float) + edited_df['Excise_Kg'].astype(float) + edited_df['Transport_Kg'].astype(float) + edited_df['Labour_Kg'].astype(float)
+                    edited_df['Landed_Rate_Purchase'] = round(base_rate * 1.13, 2)
+                    edited_df['Total_Item_Cost'] = round(edited_df['Landed_Rate_Purchase'] * edited_df['Qty_Purchase'].astype(float), 2)
                     
-                    if not df_existing.empty:
-                        mat_history = df_existing[df_existing['Material'] == mat]
-                        if not mat_history.empty:
-                            latest_entry = mat_history.iloc[-1]
-                            current_cost = float(latest_entry.get('Landed_Cost_Per_KG', 0))
-                            
-                            # Usage row (Negative)
-                            row['Quantity_MT'] = -abs(qty)
-                            row['Landed_Cost_Per_KG'] = current_cost
-                            row['Total_Cost_NPR'] = -(abs(qty) * 1000 * current_cost)
-                            processed_rows.append(row.to_dict())
-                            
-                            # Balance Forward row
-                            current_qty = float(latest_entry.get('Quantity_MT', 0))
-                            new_qty = current_qty - abs(qty)
-                            processed_rows.append({
-                                "Date": row['Date'],
-                                "Invoice_No": "BALANCE-FORWARD",
-                                "Supplier": "System Generated",
-                                "Material": mat,
-                                "Quantity_MT": round(new_qty, 3),
-                                "Landed_Cost_Per_KG": current_cost,
-                                "Total_Cost_NPR": round(new_qty * 1000 * current_cost, 2),
-                                "Is_Blended": "Yes"
-                            })
-                        else:
-                            st.warning(f"Material {mat} not found in inventory. Skipped.")
-                    else:
-                        st.error("Ledger is empty.")
-                        break
-
-                if processed_rows:
-                    df_processed = pd.DataFrame(processed_rows)
+                    def calc_cost_pc(row):
+                        return round(row['Total_Item_Cost'] / row['Qty_Sales'], 2) if float(row['Qty_Sales']) > 0 else 0
+                        
+                    edited_df['Cost_Pc'] = edited_df.apply(calc_cost_pc, axis=1)
                     
-                    # Merge with existing
-                    cols_to_drop = ['New_Qty', 'Supplier_Qty', 'Supplier_Total', 'Old_Qty', 'Old_Total', 'Is_Blended']
-                    df_processed = df_processed.drop(columns=[c for c in cols_to_drop if c in df_processed.columns])
+                    # Remove the temporary column from the master sheet before combining
+                    df_purchases_clean = df_purchases.drop(columns=['Unique_Bill_ID'])
                     
-                    df_combined = pd.concat([df_existing, df_processed], ignore_index=True)
+                    # Remove the old bill rows and swap in the newly edited rows
+                    df_purchases_untouched = df_purchases_clean[~bill_mask].copy()
+                    df_combined = pd.concat([df_purchases_untouched, edited_df], ignore_index=True)
+                    
+                    # Sort chronologically and upload to Google Sheets
+                    purchases_sheet = sh.worksheet("Purchases")
                     df_combined['Date'] = pd.to_datetime(df_combined['Date'])
-                    df_combined = df_combined.sort_values(by=['Date', 'Is_Blended'], ascending=[True, True])
+                    df_combined = df_combined.sort_values(by='Date', ascending=True)
                     df_combined['Date'] = df_combined['Date'].dt.strftime('%Y-%m-%d')
                     
-                    df_combined_clean = df_combined.fillna("")
-                    data_to_write = [df_combined_clean.columns.values.tolist()] + df_combined_clean.values.tolist()
+                    df_clean = df_combined.fillna("")
+                    data_to_write = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
                     
-                    purchases_sheet.clear() 
+                    purchases_sheet.clear()
                     purchases_sheet.update(values=data_to_write, range_name="A1")
                     
-                    st.success("✅ Bulk usage processed and ledger updated.")
-                    st.cache_data.clear()
+                    st.success(f"✅ Bill updated successfully!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
                     
-    except Exception as e:
-        st.error(f"Error processing file: {e}")
+            # --- DELETE BILL BUTTON ---        
+            if c2.button("🗑️ Delete Entire Bill", type="primary"):
+                try:
+                    # Remove the temporary column from the master sheet
+                    df_purchases_clean = df_purchases.drop(columns=['Unique_Bill_ID'])
+                    
+                    # Keep everything EXCEPT the selected bill
+                    df_combined = df_purchases_clean[~bill_mask].copy()
+                    
+                    purchases_sheet = sh.worksheet("Purchases")
+                    
+                    if not df_combined.empty:
+                        df_combined['Date'] = pd.to_datetime(df_combined['Date'])
+                        df_combined = df_combined.sort_values(by='Date', ascending=True)
+                        df_combined['Date'] = df_combined['Date'].dt.strftime('%Y-%m-%d')
+                        df_clean = df_combined.fillna("")
+                        data_to_write = [df_clean.columns.values.tolist()] + df_clean.values.tolist()
+                    else:
+                        data_to_write = [df_purchases_clean.columns.values.tolist()] 
+                    
+                    purchases_sheet.clear()
+                    purchases_sheet.update(values=data_to_write, range_name="A1")
+                    
+                    st.success(f"🗑️ Bill deleted from database!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+
+# --- 4. BILL HEADER & DUPLICATE CHECK ---
+st.header("1. Bill Details")
+with st.container(border=True):
+    c1, c2, c3 = st.columns(3)
+    
+    seller_options = ["➕ Add New Seller..."] + existing_sellers
+    
+    # SMART PLACEHOLDER SEARCH
+    selected_seller = c1.selectbox(
+        "Seller Company Name", 
+        options=seller_options, 
+        index=None, 
+        placeholder="Select a Seller..."
+    )
+    
+    if selected_seller == "➕ Add New Seller...":
+        seller_name = c1.text_input("New Seller Name", placeholder="Type New Seller Name Here")
+    else:
+        seller_name = selected_seller
+        
+    bill_no = c2.text_input("Bill No.")
+    purchase_date = c3.date_input("Purchase Date")
+
+# Duplicate Bill Check Logic
+is_duplicate_bill = False
+existing_items_in_bill = [] # Create an empty list to track items
+
+if not df_purchases.empty and seller_name and bill_no:
+    clean_seller = str(seller_name).strip().lower()
+    clean_bill = str(bill_no).strip().lower()
+    
+    mask_seller = df_purchases['Seller'].astype(str).str.strip().str.lower() == clean_seller
+    mask_bill = df_purchases['Bill_No'].astype(str).str.strip().str.lower() == clean_bill
+    
+    if (mask_seller & mask_bill).any():
+        st.warning(f"⚠️ **Bill Found:** Bill No. '{bill_no}' from '{seller_name}' is already in the database.")
+        
+        # Fetch the data for this specific bill
+        bill_data = df_purchases[mask_seller & mask_bill]
+        existing_items_in_bill = bill_data['Material'].tolist() # Save the items to check later
+        
+        append_mode = st.checkbox("Unlock entry to add missing items to this existing bill")
+        
+        if not append_mode:
+            is_duplicate_bill = True
+            st.error("🛑 Entry locked to prevent accidental duplicates. Check the box above to unlock.")
+        else:
+            is_duplicate_bill = False
+            st.info("🔓 Unlocked! Ensure your 'Purchase Date' matches the original bill.")
+            
+            # --- NEW: DISPLAY EXISTING ITEMS ---
+            st.write("**Items already recorded on this bill:**")
+            st.dataframe(bill_data[['Material', 'Qty_Purchase', 'Unit_Purchase', 'Landed_Rate_Purchase', 'Total_Item_Cost']], hide_index=True)
+
+
+# --- 5. ITEM ENTRY ---
+st.header("2. Add Material")
+with st.container(border=True):
+    if not df_master.empty and 'Item_Name' in df_master.columns:
+        product_list = sorted(df_master['Item_Name'].unique())
+    else:
+        product_list = []
+
+    selected_product = st.selectbox(
+        "Select Product", 
+        options=product_list, 
+        index=None, 
+        placeholder="Type or click to find a product..."
+    )
+
+    if selected_product:
+        if selected_product in existing_items_in_bill:
+            st.error(f"🚨 **Heads Up!** '{selected_product}' is already on this bill! Adding it again will overwrite your previous entry.")
+            
+        item_info = df_master[df_master['Item_Name'] == selected_product].iloc[0]
+        group = item_info['Group']
+        sub_group = item_info['Sub-Group']
+        p_unit = item_info['Purchase_Unit']
+        s_unit = item_info['Sales_Unit']
+        
+        try:
+            conv_fact = float(item_info['Conversion_Factor'])
+        except (ValueError, TypeError):
+            conv_fact = 1.0
+
+        st.write(f"**Classification:** {group} > {sub_group}")
+        st.info(f"**Unit Logic:** Purchased in {p_unit} | Sales tracked in {s_unit}")
+
+        costing_strategy = "Override with New Costing"
+        recent_purchase = None
+        
+        if not df_purchases.empty and selected_product in df_purchases['Material'].values:
+            item_history = df_purchases[df_purchases['Material'] == selected_product].copy()
+            item_history['Date'] = pd.to_datetime(item_history['Date'])
+            item_history = item_history.sort_values(by='Date')
+            recent_purchase = item_history.iloc[-1]
+            
+            days_since = (pd.to_datetime(purchase_date) - recent_purchase['Date']).days
+            
+            old_date = recent_purchase['Date'].strftime('%Y-%m-%d')
+            old_rate = float(recent_purchase.get('Rate_Purchase', 0))
+            old_landed = float(recent_purchase.get('Landed_Rate_Purchase', 0))
+            old_seller = str(recent_purchase.get('Seller', 'Unknown'))
+            
+            st.success(f"📜 **Last Purchase Details:** You bought this **{days_since} days ago** ({old_date}) from {old_seller}. \n\n **Old Base Rate:** {old_rate:,.2f} / {p_unit} &nbsp;&nbsp;|&nbsp;&nbsp; **Old Landed Rate:** {old_landed:,.2f} / {p_unit}")
+            
+            if 0 <= days_since <= 15:
+                st.warning(f"🕒 **High-Frequency Purchase:** Because this was bought within 15 days, you can choose to blend the inventory costs.")
+                costing_strategy = st.radio(
+                    "Price Fluctuation Strategy:",
+                    options=["Override with New Costing", "Weighted Average (Blend Old + New)"]
+                )
+
+        i1, i2, i3 = st.columns(3)
+        qty_p = i1.number_input(f"Total Quantity ({p_unit})", min_value=0.0, step=0.1)
+        rate_p = i2.number_input(f"Purchase Rate (per {p_unit})", min_value=0.0)
+        qty_s = i3.number_input(f"Calculated Qty ({s_unit})", value=float(qty_p * conv_fact))
+
+        st.write("---")
+        st.caption("Additional Costs & Discounts (Calculated per Purchase Unit)")
+        f1, f2, f3 = st.columns(3)
+        excise = f1.number_input("Excise Duty", min_value=0.0)
+        trans = f2.number_input("Transport Cost", min_value=0.0)
+        labour = f3.number_input("Labour Cost", min_value=0.0)
+        
+        d1, d2 = st.columns(2)
+        d_type = d1.selectbox("Discount Type", ["None", "Per Unit", "Percentage (%)"])
+        d_val = d2.number_input("Discount Value", min_value=0.0)
+
+        if st.button("➕ Add Item to Bill", disabled=is_duplicate_bill):
+            base_rate = rate_p + excise + trans + labour
+            
+            if d_type == "Per Unit":
+                taxable = base_rate - d_val
+            elif d_type == "Percentage (%)":
+                taxable = base_rate * (1 - (d_val/100))
+            else:
+                taxable = base_rate
+            
+            landed_rate_p = taxable * 1.13 
+            total_item_val = landed_rate_p * qty_p
+            cost_per_s_unit = total_item_val / qty_s if qty_s > 0 else 0
+
+            # --- NEW: ISOLATE TODAY'S INVOICE FROM THE DATABASE MATH ---
+            supplier_qty = qty_p
+            supplier_total = total_item_val
+            old_qty_val = 0
+            old_total_val = 0
+            is_blended = "No"
+
+            if costing_strategy == "Weighted Average (Blend Old + New)" and recent_purchase is not None:
+                old_qty_val = float(recent_purchase.get('Qty_Purchase', 0))
+                old_qty_s = float(recent_purchase.get('Qty_Sales', 0))
+                old_total_val = float(recent_purchase.get('Total_Item_Cost', 0))
+                
+                new_qty_p = old_qty_val + qty_p
+                new_qty_s = old_qty_s + qty_s
+                new_total_cost = old_total_val + total_item_val
+                
+                landed_rate_p = new_total_cost / new_qty_p if new_qty_p > 0 else 0
+                cost_per_s_unit = new_total_cost / new_qty_s if new_qty_s > 0 else 0
+                
+                rate_p = round((float(recent_purchase.get('Rate_Purchase', 0)) + rate_p) / 2, 2)
+                excise = round((float(recent_purchase.get('Excise_Kg', 0)) + excise) / 2, 2)
+                trans = round((float(recent_purchase.get('Transport_Kg', 0)) + trans) / 2, 2)
+                labour = round((float(recent_purchase.get('Labour_Kg', 0)) + labour) / 2, 2)
+                
+                qty_p = new_qty_p
+                qty_s = new_qty_s
+                total_item_val = new_total_cost
+                is_blended = "Yes"
+                st.toast("✅ Applied Weighted Average pricing logic.")
+
+            existing_item_index = None
+            for i, item in enumerate(st.session_state.bill_items):
+                if item["Material"] == selected_product:
+                    existing_item_index = i
+                    break
+
+            # Create the payload dictionary
+            new_entry = {
+                "Seller": seller_name,
+                "Bill_No": bill_no,
+                "Date": str(purchase_date),
+                "Group": group,
+                "Sub-Group": sub_group,
+                "Material": selected_product,
+                "Qty_Purchase": qty_p,
+                "Unit_Purchase": p_unit,
+                "Qty_Sales": qty_s,
+                "Unit_Sales": s_unit,
+                "Rate_Purchase": rate_p,
+                "Excise_Kg": excise,
+                "Transport_Kg": trans,
+                "Labour_Kg": labour,
+                "Landed_Rate_Purchase": round(landed_rate_p, 2),
+                "Cost_Pc": round(cost_per_s_unit, 2),
+                "Total_Item_Cost": round(total_item_val, 2),
+                # Hidden Trackers for Review Screen
+                "Supplier_Qty": supplier_qty,
+                "Supplier_Total": round(supplier_total, 2),
+                "Old_Qty": old_qty_val,
+                "Old_Total": old_total_val,
+                "Is_Blended": is_blended
+            }
+
+            if existing_item_index is not None:
+                st.session_state.bill_items.pop(existing_item_index)
+                st.session_state.bill_items.append(new_entry)
+                st.success(f"🔄 Merged {selected_product} with previous entry.")
+            else:
+                st.session_state.bill_items.append(new_entry)
+                st.success(f"➕ Added {selected_product} to bill.")
+                
+
+# --- 6. REVIEW AND SAVE ---
+if st.session_state.bill_items:
+    st.header("3. Bill Review")
+    
+    df_bill = pd.DataFrame(st.session_state.bill_items)
+    
+    # --- VISUAL BREAKDOWN FOR BLENDED ITEMS ---
+    blended_mask = df_bill['Is_Blended'] == 'Yes'
+    if blended_mask.any():
+        st.subheader("⚖️ 15-Day Blended Costing Breakdown")
+        st.info("You chose to blend these new purchases with your inventory from the last 15 days. The 'Database' column shows the new weighted average.")
+        
+        compare_df = df_bill[blended_mask]
+        for idx, row in compare_df.iterrows():
+            st.markdown(f"**{row['Material']}**")
+            b1, b2, b3 = st.columns(3)
+            b1.metric("Old Inventory (Last 15 Days)", f"{row['Old_Total']:,.2f}", f"{row['Old_Qty']} {row['Unit_Purchase']}")
+            b2.metric("Today's Invoice (New Addition)", f"{row['Supplier_Total']:,.2f}", f"{row['Supplier_Qty']} {row['Unit_Purchase']}")
+            b3.metric("Final Blended Value (Database)", f"{row['Total_Item_Cost']:,.2f}", f"{row['Qty_Purchase']} {row['Unit_Purchase']}")
+            st.write("---")
+
+    # --- TODAY'S PHYSICAL INVOICE ---
+    st.subheader("🧾 Today's Physical Invoice")
+    
+    # We display ONLY the 'Supplier' data here so the screen matches the paper bill exactly
+    invoice_df = df_bill[['Material', 'Supplier_Qty', 'Unit_Purchase', 'Supplier_Total']].copy()
+    invoice_df.columns = ['Material', 'Qty Bought Today', 'Unit', 'Total Cost Today']
+    st.dataframe(invoice_df, hide_index=True)
+        
+    # Totals are calculated strictly on Today's money
+    total_bill_new_session = df_bill['Supplier_Total'].astype(float).sum()
+    deductions = (df_bill['Transport_Kg'].astype(float) + df_bill['Labour_Kg'].astype(float)) * df_bill['Supplier_Qty'].astype(float) * 1.13
+    total_supplier_only = total_bill_new_session - deductions.sum()
+    
+    t1, t2 = st.columns(2)
+    t1.metric("Total Landed Bill (Today's Money)", f"{total_bill_new_session:,.2f}")
+    t2.metric("Supplier Invoice (Excl. Transport/Labour)", f"{total_supplier_only:,.2f}")
+
+    # --- FINAL SAVE LOGIC ---
+    if st.button("💾 Save Final Bill & Update Costings"):
+        try:
+            # 1. Clean up the dataframe to remove our hidden trackers before uploading to Sheets
+            cols_to_drop = ['Supplier_Qty', 'Supplier_Total', 'Old_Qty', 'Old_Total', 'Is_Blended']
+            df_new_clean = df_bill.drop(columns=[col for col in cols_to_drop if col in df_bill.columns])
+            
+            purchases_sheet = sh.worksheet("Purchases")
+            existing_data = purchases_sheet.get_all_records()
+            df_existing = pd.DataFrame(existing_data)
+            
+            if not df_existing.empty:
+                df_combined = pd.concat([df_existing, df_new_clean], ignore_index=True)
+                df_combined['Date'] = pd.to_datetime(df_combined['Date'])
+                df_combined = df_combined.sort_values(by='Date', ascending=True)
+                df_combined = df_combined.drop_duplicates(subset=['Material'], keep='last')
+                df_combined['Date'] = df_combined['Date'].dt.strftime('%Y-%m-%d')
+            else:
+                df_combined = df_new_clean
+                
+            df_combined_clean = df_combined.fillna("")
+            data_to_write = [df_combined_clean.columns.values.tolist()] + df_combined_clean.values.tolist()
+            
+            purchases_sheet.clear() 
+            purchases_sheet.update(values=data_to_write, range_name="A1")
+            
+            st.success("✅ Sheet updated! Blended costings were prioritized and saved.")
+            st.balloons()
+            st.session_state.bill_items = [] 
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"Save failed: {e}")
