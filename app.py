@@ -34,7 +34,7 @@ if "sh" not in st.session_state:
         
         # Look how clean this is now! It securely grabs the whole dictionary from the vault.
         creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], 
+            st.secrets["gsheets"], 
             scopes=scopes
         )
         client = gspread.authorize(creds)
