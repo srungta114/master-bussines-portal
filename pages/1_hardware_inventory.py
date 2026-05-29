@@ -113,7 +113,16 @@ def save_purchases(df_to_save):
     df_save = df_to_save.copy()
     if 'Date' in df_save.columns:
         df_save['Date'] = pd.to_datetime(df_save['Date'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
-        df_save['Fiscal Year'] = df_save['Date'].apply(get_nepali_fiscal_year)
+        calculated_fy = df_save['Date'].apply(get_nepali_fiscal_year)
+        
+        if 'Fiscal Year' in df_save.columns:
+            # Keep manual FY if provided, otherwise auto-calculate
+            df_save['Fiscal Year'] = [
+                fy if str(fy).strip() not in ["", "nan", "None", "Unknown"] else calc 
+                for fy, calc in zip(df_save['Fiscal Year'], calculated_fy)
+            ]
+        else:
+            df_save['Fiscal Year'] = calculated_fy
     
     if 'Fiscal Year' in df_save.columns:
         existing_ws = {ws.title: ws for ws in sh.worksheets() if ws.title.startswith("FY ")}
@@ -273,6 +282,13 @@ def normalize_text(text):
         t += ' black pipe'
         
     return " ".join(t.split())
+
+elif trans_type == "Opening Stock":
+            bill_number = "OPENING-STOCK"
+            st.info("Transaction will be securely recorded as OPENING-STOCK.")
+            opening_fy_input = st.text_input("Target Fiscal Year", value="FY 2082-83", help="Specify which fiscal year this stock belongs to.")
+        else:
+            opening_fy_input = None
 
 # --- REWORKED AI LOGIC WITH DUAL-NORMALIZATION ---
 def find_best_match(description, mapped_keywords=""):
@@ -563,7 +579,7 @@ with tab1:
                     for _, row in edited_cart.iterrows():
                         records_to_save.append({
                             "Date": entry_date.strftime("%d/%m/%Y"),
-                            "Fiscal Year": get_nepali_fiscal_year(entry_date.strftime("%d/%m/%Y")),
+                            "Fiscal Year": opening_fy_input if trans_type == "Opening Stock" else get_nepali_fiscal_year(entry_date.strftime("%d/%m/%Y")),
                             "Bill Number": bill_number,
                             "Group": row["Group"],
                             "Item_Name": row["Item_Name"],
