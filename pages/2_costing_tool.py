@@ -3,11 +3,17 @@ import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
+# --- 1. SECURITY BOUNCER ---
+# If the memory was wiped (refresh) or they bypassed the login, stop the page from crashing.
+if "sh" not in st.session_state:
+    st.warning("🔒 Connection lost or not logged in.")
+    st.info("Please click the Main Portal page in your sidebar to log in and reconnect to the database.")
+    st.stop() # This halts the script here so it doesn't crash on the next lines!
+
 # --- 2. SECURE DATA LOADERS (USING SESSION STATE) ---
 @st.cache_data(ttl=60)
 def load_products():
     try:
-        # Pull the master connection created by the main_app.py
         sh = st.session_state.sh
         worksheet = sh.worksheet("Product_Master")
         df = pd.DataFrame(worksheet.get_all_records())
@@ -20,7 +26,6 @@ def load_products():
 @st.cache_data(ttl=60)
 def load_purchases_data():
     try:
-        # Pull the master connection created by the main_app.py
         sh = st.session_state.sh
         purchases_sheet = sh.worksheet("Purchases")
         return pd.DataFrame(purchases_sheet.get_all_records())
@@ -29,6 +34,7 @@ def load_purchases_data():
 
 df_master = load_products()
 df_purchases = load_purchases_data()
+
 
 # Extract unique sellers
 if not df_purchases.empty and 'Seller' in df_purchases.columns:
