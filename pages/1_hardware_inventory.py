@@ -7,6 +7,14 @@ from difflib import get_close_matches
 import re
 import io
 
+# --- 1. SECURITY BOUNCER ---
+# If the memory was wiped (refresh) or they bypassed the login, stop the page from crashing.
+if "sh" not in st.session_state:
+    st.warning("🔒 Connection lost or not logged in.")
+    st.info("Please click the Main Portal page in your sidebar to log in and reconnect to the database.")
+    st.stop() # This halts the script here so it doesn't crash on the next lines!
+
+
 # --- SECURE CREDENTIALS & AUTHENTICATION ---
 gsheet_creds = st.secrets["gsheets"]
 
