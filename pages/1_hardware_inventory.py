@@ -911,14 +911,14 @@ with tab2:
                                         pur_qty = 0
                                         pur_unit = "-"
                                     else:
+                                        else:
                                         item_details = products_df[products_df['Item_Name'] == current_item].iloc[0]
                                         group_val = item_details['Group']
                                         sales_unit = item_details['Sales_Unit']
                                         
-                                        original_qty = float(st.session_state.raw_upload_data[st.session_state.raw_upload_data[1].astype(str).str.strip() == orig_row['Bill Number']].iloc[0][2])
-                                        stock_qty_added = abs(original_qty) * qty_multiplier
+                                        stock_qty_added = abs(orig_row['Stock Qty Added']) * qty_multiplier
                                         
-                                        pur_qty = abs(original_qty) if bulk_type in ["Purchases", "Purchase Returns"] else 0
+                                        pur_qty = orig_row['Purchase Qty'] if bulk_type in ["Purchases", "Purchase Returns"] else 0
                                         pur_unit = item_details['Purchase_Unit'] if bulk_type in ["Purchases", "Purchase Returns"] else "-"
                                         
                                     final_records_to_commit.append({
