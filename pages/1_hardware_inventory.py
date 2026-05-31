@@ -911,7 +911,6 @@ with tab2:
                                         pur_qty = 0
                                         pur_unit = "-"
                                     else:
-                                        else:
                                         item_details = products_df[products_df['Item_Name'] == current_item].iloc[0]
                                         group_val = item_details['Group']
                                         sales_unit = item_details['Sales_Unit']
