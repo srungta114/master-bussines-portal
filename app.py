@@ -56,7 +56,8 @@ st.write("Welcome! Please select a tool from the sidebar menu.")
 # Define the pages
 inventory_page = st.Page("pages/1_hardware_inventory.py", title="Hardware Inventory", icon="📦")
 costing_page = st.Page("pages/2_costing_tool.py", title="Costing Tool", icon="💰")
+debtors_page = st.Page("pages/3_debtor_statements.py", title="Debtor Statements", icon="🧾")
 
 # Run the navigation
-pg = st.navigation([inventory_page, costing_page])
+pg = st.navigation([inventory_page, costing_page, debtors_page])
 pg.run()
