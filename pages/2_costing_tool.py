@@ -168,7 +168,7 @@ with st.expander("Modify or Delete an existing bill", expanded=False):
                     df_combined = pd.concat([df_purchases_untouched, edited_df], ignore_index=True)
                     
                     # Sort chronologically and upload to Google Sheets
-                    purchases_sheet = sh.worksheet("Purchases")
+                    purchases_sheet = st.session_state.sh.worksheet("Purchases")
                     df_combined['Date'] = pd.to_datetime(df_combined['Date'])
                     df_combined = df_combined.sort_values(by='Date', ascending=True)
                     df_combined['Date'] = df_combined['Date'].dt.strftime('%Y-%m-%d')
@@ -193,7 +193,7 @@ with st.expander("Modify or Delete an existing bill", expanded=False):
                     # Keep everything EXCEPT the selected bill
                     df_combined = df_purchases_clean[~bill_mask].copy()
                     
-                    purchases_sheet = sh.worksheet("Purchases")
+                    purchases_sheet = st.session_state.sh.worksheet("Purchases")
                     
                     if not df_combined.empty:
                         df_combined['Date'] = pd.to_datetime(df_combined['Date'])
@@ -472,7 +472,7 @@ if st.session_state.bill_items:
             cols_to_drop = ['Supplier_Qty', 'Supplier_Total', 'Old_Qty', 'Old_Total', 'Is_Blended']
             df_new_clean = df_bill.drop(columns=[col for col in cols_to_drop if col in df_bill.columns])
             
-            purchases_sheet = sh.worksheet("Purchases")
+            purchases_sheet = st.session_state.sh.worksheet("Purchases")
             existing_data = purchases_sheet.get_all_records()
             df_existing = pd.DataFrame(existing_data)
             
