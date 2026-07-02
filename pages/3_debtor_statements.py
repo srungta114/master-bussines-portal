@@ -2,8 +2,10 @@ import streamlit as st
 import re
 import io
 import zipfile
+import pandas as pd
+from datetime import datetime
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font, Alignment, PatternFill
 
 # --- 1. SECURITY BOUNCER ---
 if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
@@ -14,13 +16,14 @@ if "password_correct" not in st.session_state or not st.session_state["password_
 st.title("🧾 Debtor Statement Generator")
 st.write(
     "Upload your full Debtors Ledger export. This tool will clean it up, drop any "
-    "debtor with a nil balance, and produce one formatted statement per remaining "
-    "debtor — packaged as a single zip file for download."
+    "debtor with a nil balance, let you filter and preview the remaining debtors, "
+    "and produce formatted statements — split into one zip per balance range you define."
 )
 
 # --- 2. FORMATTING CONSTANTS (matches the R R Metal reference format) ---
 ACCT_FMT = '_(* #,##0.00_);_(* \\(#,##0.00\\);_(* "-"??_);_(@_)'
 DATE_FMT = 'mm-dd-yy'
+HEADER_FILL = 'FFC0C0C0'
 
 
 def clean_name(raw):
@@ -29,6 +32,14 @@ def clean_name(raw):
     if ' - ' in raw:
         return raw.split(' - ', 1)[1].strip()
     return raw
+
+
+def get_code(raw):
+    """Extract the leading debtor code (before ' - ')."""
+    raw = str(raw).strip()
+    if ' - ' in raw:
+        return raw.split(' - ', 1)[0].strip()
+    return ''
 
 
 def sanitize_filename(name):
@@ -53,7 +64,6 @@ def parse_debtors(file_obj):
         d = ws.cell(r, 4).value
         e = ws.cell(r, 5).value
 
-        # New debtor starts wherever column A says "Customer:"
         if a is not None and str(a).strip() == 'Customer:':
             if current:
                 blocks.append(current)
@@ -99,16 +109,40 @@ def is_nil(block):
     return 'nil' in str(text).lower()
 
 
-def style_cell(cell, bold=False, color=None, align=None, numfmt=None):
+def get_final_balance(block):
+    """Signed numeric balance: positive = Dr (owes us), negative = Cr (we owe them)."""
+    text = block['final_balance_text']
+    if text is None and block['txns']:
+        text = block['txns'][-1]['bal_text']
+    if text is None:
+        return 0.0
+    text = str(text).strip()
+    num_match = re.search(r'[\d,]+\.?\d*', text)
+    if not num_match:
+        return 0.0
+    val = float(num_match.group().replace(',', ''))
+    return -val if 'cr' in text.lower() else val
+
+
+def get_last_txn_date(block):
+    """Most recent transaction date for this debtor, or None if no dated transactions."""
+    dates = [t['date'] for t in block['txns'] if isinstance(t['date'], datetime)]
+    return max(dates) if dates else None
+
+
+def style_cell(cell, bold=False, color=None, align=None, numfmt=None, fill=None):
     cell.font = Font(name='Arial', size=10, bold=bold, color=color)
     if align:
         cell.alignment = Alignment(horizontal=align)
     if numfmt:
         cell.number_format = numfmt
+    if fill:
+        cell.fill = PatternFill('solid', start_color=fill, end_color=fill)
 
 
 def build_workbook(block):
-    """Build a single-debtor statement workbook, formatted like the R R Metal reference file."""
+    """Build a single-debtor statement workbook, formatted like the R R Metal reference file,
+    with the Date/Particulars/Debit/Credit/Balance header row from the source ledger."""
     title = clean_name(block['raw_name'])
 
     wb = Workbook()
@@ -124,14 +158,18 @@ def build_workbook(block):
     ws.merge_cells('A1:D1')
     ws['A1'] = title
     style_cell(ws['A1'], bold=True, color='FF0000FF', align='center')
-    ws['E1'] = 0
-    style_cell(ws['E1'], align='right', numfmt=ACCT_FMT)
 
-    row = 2
+    headers = ['Date', 'Particulars', 'Debit', 'Credit', 'Balance']
+    for col, text in enumerate(headers, start=1):
+        cell = ws.cell(2, col, text)
+        align = 'right' if col in (3, 4, 5) else None
+        style_cell(cell, bold=True, align=align, fill=HEADER_FILL)
+
+    row = 3
     if block['opening'] is not None:
         ws.cell(row, 2, 'Opening Balance...')
         ws.cell(row, 3, block['opening'])
-        ws.cell(row, 5, f'=E{row-1}+C{row}-D{row}')
+        ws.cell(row, 5, f'=C{row}-D{row}')
         style_cell(ws.cell(row, 2))
         style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT)
         style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT)
@@ -152,12 +190,13 @@ def build_workbook(block):
             ws.cell(row, 4, txn['credit'])
         style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT)
 
-        ws.cell(row, 5, f'=E{row-1}+C{row}-D{row}')
+        formula = f'=C{row}-D{row}' if row == 3 else f'=E{row-1}+C{row}-D{row}'
+        ws.cell(row, 5, formula)
         style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT)
         row += 1
 
     last_row = row - 1
-    if last_row >= 2:
+    if last_row >= 3:
         style_cell(ws.cell(last_row, 5), bold=True, align='right', numfmt=ACCT_FMT)
 
     buf = io.BytesIO()
@@ -166,56 +205,211 @@ def build_workbook(block):
     return buf, title
 
 
-# --- 3. UI: UPLOAD & PROCESS ---
+def build_summary_workbook(rows_df):
+    """Master summary sheet listing every included debtor."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Summary'
+
+    widths = {'A': 12, 'B': 45, 'C': 16, 'D': 14, 'E': 12}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    headers = ['Code', 'Debtor Name', 'Final Balance', 'Last Transaction', 'Days Since']
+    for col, text in enumerate(headers, start=1):
+        cell = ws.cell(1, col, text)
+        align = 'right' if col in (3, 5) else None
+        style_cell(cell, bold=True, align=align, fill=HEADER_FILL)
+
+    row = 2
+    for _, r in rows_df.iterrows():
+        ws.cell(row, 1, r['Code'])
+        style_cell(ws.cell(row, 1))
+        ws.cell(row, 2, r['Debtor Name'])
+        style_cell(ws.cell(row, 2))
+        ws.cell(row, 3, r['Final Balance'])
+        style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT)
+        if pd.notna(r['Last Transaction']):
+            ws.cell(row, 4, r['Last Transaction'])
+            style_cell(ws.cell(row, 4), numfmt=DATE_FMT)
+        else:
+            style_cell(ws.cell(row, 4))
+        ws.cell(row, 5, r['Days Since'] if pd.notna(r['Days Since']) else None)
+        style_cell(ws.cell(row, 5), align='right')
+        row += 1
+
+    total_row = row
+    ws.cell(total_row, 2, 'TOTAL')
+    style_cell(ws.cell(total_row, 2), bold=True)
+    ws.cell(total_row, 3, f'=SUM(C2:C{row-1})')
+    style_cell(ws.cell(total_row, 3), bold=True, align='right', numfmt=ACCT_FMT)
+    ws.cell(total_row, 1, f'=COUNTA(A2:A{row-1})')
+    style_cell(ws.cell(total_row, 1), bold=True)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
+
+
+# --- 3. UI: UPLOAD & PARSE ---
 uploaded_file = st.file_uploader("Upload Debtors Ledger (.xlsx)", type=["xlsx"])
 
 if uploaded_file is not None:
-    if st.button("⚙️ Process Ledger & Generate Statements"):
+    if "debtor_blocks" not in st.session_state or st.session_state.get("debtor_file_name") != uploaded_file.name:
         with st.spinner("Reading and parsing the ledger..."):
             try:
-                blocks = parse_debtors(uploaded_file)
+                st.session_state.debtor_blocks = parse_debtors(uploaded_file)
+                st.session_state.debtor_file_name = uploaded_file.name
             except Exception as e:
                 st.error(f"Failed to read the file: {e}")
                 st.stop()
 
-        total = len(blocks)
-        kept_blocks = [b for b in blocks if not is_nil(b)]
-        nil_count = total - len(kept_blocks)
+    blocks = st.session_state.debtor_blocks
+    total = len(blocks)
+    non_nil_blocks = [b for b in blocks if not is_nil(b)]
+    nil_count = total - len(non_nil_blocks)
 
-        st.success(
-            f"✅ Parsed {total} debtors — {nil_count} had a nil balance and were removed, "
-            f"{len(kept_blocks)} remain."
+    st.success(
+        f"✅ Parsed {total} debtors — {nil_count} had a nil balance and were removed, "
+        f"{len(non_nil_blocks)} remain."
+    )
+
+    if not non_nil_blocks:
+        st.warning("No debtors with an outstanding balance were found.")
+        st.stop()
+
+    # --- 4. BUILD METRICS TABLE ---
+    all_last_dates = [get_last_txn_date(b) for b in blocks]
+    all_last_dates = [d for d in all_last_dates if d is not None]
+    reference_date = max(all_last_dates) if all_last_dates else None
+
+    records = []
+    for b in non_nil_blocks:
+        last_date = get_last_txn_date(b)
+        days_since = (reference_date - last_date).days if (reference_date and last_date) else None
+        records.append({
+            'Code': get_code(b['raw_name']),
+            'Debtor Name': clean_name(b['raw_name']),
+            'Final Balance': get_final_balance(b),
+            'Last Transaction': last_date,
+            'Days Since': days_since,
+            '_block': b,
+        })
+    df_all = pd.DataFrame(records)
+
+    if reference_date:
+        st.caption(
+            f"📅 'Days Since' is calculated against the most recent transaction date found "
+            f"in the uploaded ledger ({reference_date.strftime('%Y-%m-%d')}), not today's calendar date, "
+            f"since these are Bikram Sambat dates."
         )
 
-        if not kept_blocks:
-            st.warning("No debtors with an outstanding balance were found.")
-            st.stop()
+    # --- 5. SEARCH ---
+    st.header("🔍 Search")
+    search_term = st.text_input("Search debtor name", placeholder="Type to filter by name...")
 
-        with st.spinner(f"Generating {len(kept_blocks)} formatted statements..."):
-            zip_buf = io.BytesIO()
-            used_names = {}
-            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    df_search = df_all
+    if search_term:
+        df_search = df_search[df_search['Debtor Name'].str.contains(search_term, case=False, na=False)]
+
+    bal_min, bal_max = float(df_search['Final Balance'].min()), float(df_search['Final Balance'].max())
+    st.caption(
+        f"Debit (Dr.) balances are positive, Credit (Cr.) balances are negative. "
+        f"Balances currently range from {bal_min:,.2f} to {bal_max:,.2f}."
+    )
+
+    # --- 6. MULTIPLE BALANCE RANGES ---
+    st.header("🎚️ Define Balance Ranges")
+    st.caption(
+        "Each range you define below will be generated as its own zip file "
+        "(with its own summary sheet and individual statements)."
+    )
+
+    if "num_ranges" not in st.session_state:
+        st.session_state.num_ranges = 1
+
+    rc1, rc2, rc3 = st.columns([1, 1, 2])
+    if rc1.button("➕ Add Range"):
+        st.session_state.num_ranges += 1
+    if rc2.button("➖ Remove Range") and st.session_state.num_ranges > 1:
+        st.session_state.num_ranges -= 1
+
+    ranges = []
+    for i in range(st.session_state.num_ranges):
+        col1, col2 = st.columns(2)
+        r_min = col1.number_input(
+            f"Range {i + 1} — Minimum Balance", value=bal_min, key=f"range_min_{i}"
+        )
+        r_max = col2.number_input(
+            f"Range {i + 1} — Maximum Balance", value=bal_max, key=f"range_max_{i}"
+        )
+        ranges.append((r_min, r_max))
+
+    # --- 7. PREVIEW PER RANGE ---
+    st.header("👀 Preview")
+    range_dfs = []
+    for i, (r_min, r_max) in enumerate(ranges):
+        df_range = df_search[
+            (df_search['Final Balance'] >= r_min) & (df_search['Final Balance'] <= r_max)
+        ]
+        range_dfs.append(df_range)
+
+        with st.expander(
+            f"Range {i + 1}: {r_min:,.2f} to {r_max:,.2f} — "
+            f"{len(df_range)} debtors, total {df_range['Final Balance'].sum():,.2f}"
+        ):
+            st.dataframe(
+                df_range.drop(columns=['_block']).style.format({
+                    'Final Balance': '{:,.2f}',
+                    'Last Transaction': lambda d: d.strftime('%Y-%m-%d') if pd.notna(d) else '',
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    total_selected = sum(len(d) for d in range_dfs)
+    if total_selected == 0:
+        st.warning("No debtors fall within the defined ranges.")
+        st.stop()
+
+    # --- 8. GENERATE ---
+    if st.button("⚙️ Generate Zip Files"):
+        with st.spinner("Generating statements for each range..."):
+            master_zip_buf = io.BytesIO()
+            with zipfile.ZipFile(master_zip_buf, "w", zipfile.ZIP_DEFLATED) as master_zf:
                 progress = st.progress(0)
-                for i, block in enumerate(kept_blocks):
-                    file_buf, title = build_workbook(block)
-                    fname = sanitize_filename(title)
+                done = 0
+                for i, df_range in enumerate(range_dfs):
+                    r_min, r_max = ranges[i]
+                    folder = f"Range_{i + 1} ({r_min:,.2f} to {r_max:,.2f})"
 
-                    # Guard against duplicate debtor names colliding in the zip
-                    if fname in used_names:
-                        used_names[fname] += 1
-                        fname = f"{fname} ({used_names[fname]})"
-                    else:
-                        used_names[fname] = 0
+                    if df_range.empty:
+                        continue
 
-                    zf.writestr(f"{fname}.xlsx", file_buf.getvalue())
-                    progress.progress((i + 1) / len(kept_blocks))
-            zip_buf.seek(0)
+                    summary_buf = build_summary_workbook(df_range)
+                    master_zf.writestr(f"{folder}/0_Summary.xlsx", summary_buf.getvalue())
 
-        st.success("🎉 All statements generated!")
+                    used_names = {}
+                    for _, r in df_range.iterrows():
+                        file_buf, title = build_workbook(r['_block'])
+                        fname = sanitize_filename(title)
+                        if fname in used_names:
+                            used_names[fname] += 1
+                            fname = f"{fname} ({used_names[fname]})"
+                        else:
+                            used_names[fname] = 0
+                        master_zf.writestr(f"{folder}/{fname}.xlsx", file_buf.getvalue())
+
+                        done += 1
+                        progress.progress(done / total_selected)
+            master_zip_buf.seek(0)
+
+        st.success(f"🎉 Generated {len(ranges)} range folder(s) inside one zip!")
         st.download_button(
-            label="⬇️ Download All Statements (.zip)",
-            data=zip_buf,
-            file_name="Debtor_Statements.zip",
+            label="⬇️ Download All Ranges (.zip)",
+            data=master_zip_buf,
+            file_name="Debtor_Statements_By_Range.zip",
             mime="application/zip",
         )
 else:
