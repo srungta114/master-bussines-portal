@@ -3,9 +3,9 @@ import re
 import io
 import zipfile
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, Alignment, PatternFill
+from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 # --- 1. SECURITY BOUNCER ---
 if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
@@ -20,10 +20,12 @@ st.write(
     "and produce formatted statements — split into one zip per balance range you define."
 )
 
-# --- 2. FORMATTING CONSTANTS (matches the R R Metal reference format) ---
+# --- 2. FORMATTING CONSTANTS (matches the updated R R Metal reference format) ---
 ACCT_FMT = '_(* #,##0.00_);_(* \\(#,##0.00\\);_(* "-"??_);_(@_)'
 DATE_FMT = 'mm-dd-yy'
 HEADER_FILL = 'FFC0C0C0'
+THIN = Side(style='thin')
+FULL_BORDER = Border(top=THIN, bottom=THIN, left=THIN, right=THIN)
 
 
 def clean_name(raw):
@@ -130,7 +132,7 @@ def get_last_txn_date(block):
     return max(dates) if dates else None
 
 
-def style_cell(cell, bold=False, color=None, align=None, numfmt=None, fill=None):
+def style_cell(cell, bold=False, color=None, align=None, numfmt=None, fill=None, border=True):
     cell.font = Font(name='Arial', size=10, bold=bold, color=color)
     if align:
         cell.alignment = Alignment(horizontal=align)
@@ -138,40 +140,56 @@ def style_cell(cell, bold=False, color=None, align=None, numfmt=None, fill=None)
         cell.number_format = numfmt
     if fill:
         cell.fill = PatternFill('solid', start_color=fill, end_color=fill)
+    if border:
+        cell.border = FULL_BORDER
 
 
 def build_workbook(block):
-    """Build a single-debtor statement workbook, formatted like the R R Metal reference file,
-    with the Date/Particulars/Debit/Credit/Balance header row from the source ledger."""
+    """Build a single-debtor statement workbook, formatted to match the updated
+    R R Metal reference file: header row first, title row second, full thin borders."""
     title = clean_name(block['raw_name'])
 
     wb = Workbook()
     ws = wb.active
     ws.title = 'Sheet1'
 
-    ws.column_dimensions['A'].width = 10.78
-    ws.column_dimensions['B'].width = 38.78
-    ws.column_dimensions['C'].width = 13.11
-    ws.column_dimensions['D'].width = 11.44
-    ws.column_dimensions['E'].width = 14.0
+    ws.column_dimensions['A'].width = 10.14
+    ws.column_dimensions['B'].width = 23.14
+    ws.column_dimensions['C'].width = 12.86
+    ws.column_dimensions['D'].width = 11.29
+    ws.column_dimensions['E'].width = 12.86
 
-    ws.merge_cells('A1:D1')
-    ws['A1'] = title
-    style_cell(ws['A1'], bold=True, color='FF0000FF', align='center')
-
+    # Row 1: Header
     headers = ['Date', 'Particulars', 'Debit', 'Credit', 'Balance']
     for col, text in enumerate(headers, start=1):
-        cell = ws.cell(2, col, text)
+        cell = ws.cell(1, col, text)
         align = 'right' if col in (3, 4, 5) else None
-        style_cell(cell, bold=True, align=align, fill=HEADER_FILL)
+        style_cell(cell, bold=True, color='FF000000', align=align, fill=HEADER_FILL,
+                   numfmt=ACCT_FMT if col in (3, 4, 5) else None)
+
+    # Row 2: Title + running-balance seed
+    ws.merge_cells('A2:D2')
+    ws['A2'] = title
+    style_cell(ws['A2'], bold=True, color='FF0000FF', align='center', border=False)
+    ws['A2'].border = Border(top=THIN, bottom=THIN, left=THIN, right=None)
+    for coord in ('B2', 'C2'):
+        ws[coord].border = Border(top=THIN, bottom=THIN, left=None, right=None)
+        ws[coord].font = Font(name='Arial', size=10)
+    ws['D2'].border = Border(top=THIN, bottom=THIN, left=None, right=THIN)
+    ws['D2'].font = Font(name='Arial', size=10)
+
+    ws['E2'] = 0
+    style_cell(ws['E2'], align='right', numfmt=ACCT_FMT)
 
     row = 3
     if block['opening'] is not None:
         ws.cell(row, 2, 'Opening Balance...')
         ws.cell(row, 3, block['opening'])
-        ws.cell(row, 5, f'=C{row}-D{row}')
+        ws.cell(row, 5, f'=E{row-1}+C{row}-D{row}')
+        style_cell(ws.cell(row, 1))
         style_cell(ws.cell(row, 2))
         style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT)
+        style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT)
         style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT)
         row += 1
 
@@ -190,8 +208,7 @@ def build_workbook(block):
             ws.cell(row, 4, txn['credit'])
         style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT)
 
-        formula = f'=C{row}-D{row}' if row == 3 else f'=E{row-1}+C{row}-D{row}'
-        ws.cell(row, 5, formula)
+        ws.cell(row, 5, f'=E{row-1}+C{row}-D{row}')
         style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT)
         row += 1
 
@@ -279,15 +296,21 @@ if uploaded_file is not None:
         st.warning("No debtors with an outstanding balance were found.")
         st.stop()
 
-    # --- 4. BUILD METRICS TABLE ---
-    all_last_dates = [get_last_txn_date(b) for b in blocks]
-    all_last_dates = [d for d in all_last_dates if d is not None]
-    reference_date = max(all_last_dates) if all_last_dates else None
+    # --- 4. CURRENT DATE INPUT (for Days Since calculation) ---
+    st.header("📅 Set Current Date")
+    st.caption(
+        "Enter the date to calculate 'Days Since Last Purchase' against. Since your ledger "
+        "dates are Bikram Sambat numbers (not real Gregorian dates), enter the equivalent "
+        "BS date here — the tool does simple day-count arithmetic against it, not a real "
+        "calendar conversion."
+    )
+    current_date = st.date_input("Current date", value=date.today())
 
+    # --- 5. BUILD METRICS TABLE ---
     records = []
     for b in non_nil_blocks:
         last_date = get_last_txn_date(b)
-        days_since = (reference_date - last_date).days if (reference_date and last_date) else None
+        days_since = (current_date - last_date.date()).days if last_date else None
         records.append({
             'Code': get_code(b['raw_name']),
             'Debtor Name': clean_name(b['raw_name']),
@@ -298,14 +321,7 @@ if uploaded_file is not None:
         })
     df_all = pd.DataFrame(records)
 
-    if reference_date:
-        st.caption(
-            f"📅 'Days Since' is calculated against the most recent transaction date found "
-            f"in the uploaded ledger ({reference_date.strftime('%Y-%m-%d')}), not today's calendar date, "
-            f"since these are Bikram Sambat dates."
-        )
-
-    # --- 5. SEARCH ---
+    # --- 6. SEARCH ---
     st.header("🔍 Search")
     search_term = st.text_input("Search debtor name", placeholder="Type to filter by name...")
 
@@ -319,7 +335,7 @@ if uploaded_file is not None:
         f"Balances currently range from {bal_min:,.2f} to {bal_max:,.2f}."
     )
 
-    # --- 6. MULTIPLE BALANCE RANGES ---
+    # --- 7. MULTIPLE BALANCE RANGES ---
     st.header("🎚️ Define Balance Ranges")
     st.caption(
         "Each range you define below will be generated as its own zip file "
@@ -346,7 +362,7 @@ if uploaded_file is not None:
         )
         ranges.append((r_min, r_max))
 
-    # --- 7. PREVIEW PER RANGE ---
+    # --- 8. PREVIEW PER RANGE ---
     st.header("👀 Preview")
     range_dfs = []
     for i, (r_min, r_max) in enumerate(ranges):
@@ -373,7 +389,7 @@ if uploaded_file is not None:
         st.warning("No debtors fall within the defined ranges.")
         st.stop()
 
-    # --- 8. GENERATE ---
+    # --- 9. GENERATE ---
     if st.button("⚙️ Generate Zip Files"):
         with st.spinner("Generating statements for each range..."):
             master_zip_buf = io.BytesIO()
