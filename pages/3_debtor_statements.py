@@ -170,51 +170,53 @@ def build_workbook(block):
     # Row 2: Title + running-balance seed
     ws.merge_cells('A2:D2')
     ws['A2'] = title
-    style_cell(ws['A2'], bold=True, color='FF0000FF', align='center', border=False)
+    style_cell(ws['A2'], bold=True, color='FF0000FF', align='center', border=False, fill='FFFFFFFF')
     ws['A2'].border = Border(top=THIN, bottom=THIN, left=THIN, right=None)
     for coord in ('B2', 'C2'):
         ws[coord].border = Border(top=THIN, bottom=THIN, left=None, right=None)
         ws[coord].font = Font(name='Arial', size=10)
+        ws[coord].fill = PatternFill('solid', start_color='FFFFFFFF', end_color='FFFFFFFF')
     ws['D2'].border = Border(top=THIN, bottom=THIN, left=None, right=THIN)
     ws['D2'].font = Font(name='Arial', size=10)
+    ws['D2'].fill = PatternFill('solid', start_color='FFFFFFFF', end_color='FFFFFFFF')
 
     ws['E2'] = 0
-    style_cell(ws['E2'], align='right', numfmt=ACCT_FMT)
+    style_cell(ws['E2'], align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
 
     row = 3
     if block['opening'] is not None:
         ws.cell(row, 2, 'Opening Balance...')
         ws.cell(row, 3, block['opening'])
         ws.cell(row, 5, f'=E{row-1}+C{row}-D{row}')
-        style_cell(ws.cell(row, 1))
-        style_cell(ws.cell(row, 2))
-        style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT)
-        style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT)
-        style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT)
+        style_cell(ws.cell(row, 1), fill='FFFFFFFF')
+        style_cell(ws.cell(row, 2), fill='FFFFFFFF')
+        style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
+        style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
+        style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
         row += 1
 
     for txn in block['txns']:
         ws.cell(row, 1, txn['date'])
-        style_cell(ws.cell(row, 1), numfmt=DATE_FMT)
+        style_cell(ws.cell(row, 1), numfmt=DATE_FMT, fill='FFFFFFFF')
 
         ws.cell(row, 2, txn['particulars'])
-        style_cell(ws.cell(row, 2))
+        style_cell(ws.cell(row, 2), fill='FFFFFFFF')
 
         if txn['debit']:
             ws.cell(row, 3, txn['debit'])
-        style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT)
+        style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
 
         if txn['credit']:
             ws.cell(row, 4, txn['credit'])
-        style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT)
+        style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
 
         ws.cell(row, 5, f'=E{row-1}+C{row}-D{row}')
-        style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT)
+        style_cell(ws.cell(row, 5), align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
         row += 1
 
     last_row = row - 1
     if last_row >= 3:
-        style_cell(ws.cell(last_row, 5), bold=True, align='right', numfmt=ACCT_FMT)
+        style_cell(ws.cell(last_row, 5), bold=True, align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -304,7 +306,12 @@ if uploaded_file is not None:
         "BS date here — the tool does simple day-count arithmetic against it, not a real "
         "calendar conversion."
     )
-    current_date = st.date_input("Current date", value=date.today())
+    current_date = st.date_input(
+        "Current date",
+        value=date.today(),
+        min_value=date(2000, 1, 1),
+        max_value=date(2150, 12, 31),
+    )
 
     # --- 5. BUILD METRICS TABLE ---
     records = []
