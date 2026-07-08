@@ -719,6 +719,46 @@ def build_records_from_auto_matched(edited_auto_df, auto_matched, bulk_type):
     return final_records, new_learned_rules, qty_multiplier
 
 
+def compact_search_key(text):
+    """Turns '1 1/2" SQUARE PIPE 12 GAUGE' into '112sq12': strips all
+    punctuation/spaces, drops pure unit/filler words (pipe, gauge), and
+    abbreviates common shape words (square->sq, rectangle->rect, round->rnd).
+    Lets users type a quick shorthand code instead of the full item name."""
+    stopwords = {'pipe', 'gauge'}
+    abbreviations = {'square': 'sq', 'rectangle': 'rect', 'round': 'rnd'}
+    t = str(text).lower()
+    for ch in ['"', "'", '/', '-', '.']:
+        t = t.replace(ch, ' ')
+    tokens = t.split()
+    out = []
+    for tok in tokens:
+        if tok in stopwords:
+            continue
+        out.append(abbreviations.get(tok, tok))
+    return ''.join(out)
+
+
+def smart_item_search(label, items, key, placeholder="Click here to type..."):
+    """A selectbox with an added shorthand-search layer above it: typing a
+    compact code like '112sq12' filters the dropdown down to matching items,
+    on top of Streamlit's normal built-in search on the full item name."""
+    items = list(items)
+    query = st.text_input(
+        "🔍 Quick code (optional)",
+        key=f"{key}_quick_search",
+        placeholder='e.g. 112sq12 for 1 1/2" SQUARE PIPE 12 GAUGE',
+    )
+    options = items
+    if query.strip():
+        q = compact_search_key(query)
+        filtered = [it for it in items if q in compact_search_key(it)]
+        if filtered:
+            options = filtered
+        else:
+            st.caption("No items match that shorthand — showing the full list instead.")
+    return st.selectbox(label, options=options, index=None, key=key, placeholder=placeholder)
+
+
 st.title("📦 Hardware Inventory Management")
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🛒 Single Entry", "📤 Bulk Uploads", "📊 View Inventory", "📋 Masters & AI Memory", "📝 Edit Transactions"
@@ -766,8 +806,8 @@ with tab1:
 
     st.divider()
 
-    items = products_df['Item_Name'].dropna().unique()
-    selected_item = st.selectbox("Search and Select Item to Add", options=items, index=None, placeholder="Click here to type...")
+    items = products_df['Item_Name'].dropna().unique().tolist()
+    selected_item = smart_item_search("Search and Select Item to Add", items, key="tab1_item_search")
 
     if selected_item:
         item_details = products_df[products_df['Item_Name'] == selected_item].iloc[0]
@@ -1254,7 +1294,11 @@ with tab3:
         
         c1, c2 = st.columns(2)
         with c1:
-            ledger_item = st.selectbox("Select a particular item to view its ledger", options=products_df['Item_Name'].dropna().unique(), index=None)
+            ledger_item = smart_item_search(
+                "Select a particular item to view its ledger",
+                products_df['Item_Name'].dropna().unique().tolist(),
+                key="ledger_item_search",
+            )
         with c2:
             fy_options = ["All"] + sorted(purchases_df['Fiscal Year'].dropna().unique().tolist(), reverse=True) if not purchases_df.empty and 'Fiscal Year' in purchases_df.columns else ["All"]
             selected_fy = st.selectbox("Filter Ledger by Fiscal Year", options=fy_options)
