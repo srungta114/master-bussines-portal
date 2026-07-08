@@ -10,6 +10,49 @@ if "sh" not in st.session_state:
     st.info("Please click the Main Portal page in your sidebar to log in and reconnect to the database.")
     st.stop() # This halts the script here so it doesn't crash on the next lines!
 
+
+def compact_search_key(text):
+    """Turns '1 1/2" SQUARE PIPE 12 GAUGE' into '112sq12': strips all
+    punctuation/spaces, drops pure unit/filler words (pipe, gauge), and
+    abbreviates common shape words (square->sq, rectangle->rect, round->rnd).
+    Lets users type a quick shorthand code instead of the full item name.
+    Kept identical to the same function in the Hardware Inventory page so
+    shorthand codes behave the same way in both tools."""
+    stopwords = {'pipe', 'gauge'}
+    abbreviations = {'square': 'sq', 'rectangle': 'rect', 'round': 'rnd'}
+    t = str(text).lower()
+    for ch in ['"', "'", '/', '-', '.']:
+        t = t.replace(ch, ' ')
+    tokens = t.split()
+    out = []
+    for tok in tokens:
+        if tok in stopwords:
+            continue
+        out.append(abbreviations.get(tok, tok))
+    return ''.join(out)
+
+
+def smart_item_search(label, items, key, placeholder="Type or click to find an item..."):
+    """A selectbox with an added shorthand-search layer above it: typing a
+    compact code like '112sq12' filters the dropdown down to matching items,
+    on top of Streamlit's normal built-in search on the full item name."""
+    items = list(items)
+    query = st.text_input(
+        "🔍 Quick code (optional)",
+        key=f"{key}_quick_search",
+        placeholder='e.g. 112sq12 for 1 1/2" SQUARE PIPE 12 GAUGE',
+    )
+    options = items
+    if query.strip():
+        q = compact_search_key(query)
+        filtered = [it for it in items if q in compact_search_key(it)]
+        if filtered:
+            options = filtered
+        else:
+            st.caption("No items match that shorthand — showing the full list instead.")
+    return st.selectbox(label, options=options, index=None, key=key, placeholder=placeholder)
+
+
 # --- 2. SECURE DATA LOADERS (USING SESSION STATE) ---
 @st.cache_data(ttl=60)
 def load_products():
@@ -56,11 +99,11 @@ with st.expander("Search Master Database", expanded=False):
         search_materials = sorted(df_purchases['Material'].dropna().unique().tolist())
         
         # SMART PLACEHOLDER SEARCH
-        search_selection = st.selectbox(
-            "Search Database", 
-            options=search_materials, 
-            index=None, 
-            placeholder="Type or click here to search for a material..."
+        search_selection = smart_item_search(
+            "Search Database",
+            search_materials,
+            key="costing_search_db",
+            placeholder="Type or click here to search for a material...",
         )
         
         if search_selection:
@@ -275,11 +318,11 @@ with st.container(border=True):
     else:
         product_list = []
 
-    selected_product = st.selectbox(
-        "Select Product", 
-        options=product_list, 
-        index=None, 
-        placeholder="Type or click to find a product..."
+    selected_product = smart_item_search(
+        "Select Product",
+        product_list,
+        key="costing_select_product",
+        placeholder="Type or click to find a product...",
     )
 
     if selected_product:
