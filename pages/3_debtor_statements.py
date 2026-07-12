@@ -51,15 +51,66 @@ def sanitize_filename(name):
     return name[:150] if name else "Unnamed"
 
 
+def extract_ledger_header(ws):
+    """Looks for the 6-row company/report header block that Tally sometimes
+    puts above the actual 'Date | Particulars | Debit | Credit | Balance'
+    column-header row (company name, address, country, a blank spacer, the
+    report title, and the period caption - matching the R R Metal reference
+    file's rows 1-6). Returns (header_values, data_start_row):
+      - header_values is None if the uploaded ledger starts directly with
+        the column-header row (no metadata block present) - fully
+        backward compatible with ledgers that don't have this block.
+      - data_start_row is the row where 'Date'/'Particulars' actually is,
+        so the rest of the parser knows where the real data begins
+        regardless of whether a header block was found.
+    """
+    # Find the real column-header row - don't assume it's row 1.
+    header_row_idx = None
+    for r in range(1, min(ws.max_row, 20) + 1):
+        a = ws.cell(r, 1).value
+        b = ws.cell(r, 2).value
+        if str(a).strip() == 'Date' and str(b).strip() == 'Particulars':
+            header_row_idx = r
+            break
+
+    if header_row_idx is None:
+        # Couldn't find it at all in the first 20 rows - treat the whole
+        # sheet as headerless data starting at row 1, same as before.
+        return None, 1
+
+    if header_row_idx == 1:
+        # No metadata block - ledger starts directly with column headers.
+        return None, 1
+
+    if header_row_idx == 7:
+        # Exactly matches the known 6-row Tally header block layout.
+        header_values = {
+            'company_name': ws.cell(1, 1).value,
+            'fy_label': ws.cell(1, 3).value,
+            'address': ws.cell(2, 1).value,
+            'date_range': ws.cell(2, 3).value,
+            'country': ws.cell(3, 1).value,
+            'report_title': ws.cell(5, 1).value,
+            'period_caption': ws.cell(6, 1).value,
+        }
+        return header_values, header_row_idx
+
+    # Some other offset we don't recognize - safer to skip the block
+    # entirely than guess at a layout that might not match.
+    return None, header_row_idx
+
+
 def parse_debtors(file_obj):
     """Parse the Tally-style debtors ledger into a list of per-debtor blocks."""
     wb = load_workbook(file_obj, data_only=False)
     ws = wb[wb.sheetnames[0]]
 
+    ledger_header, data_start_row = extract_ledger_header(ws)
+
     blocks = []
     current = None
 
-    for r in range(2, ws.max_row + 1):
+    for r in range(data_start_row + 1, ws.max_row + 1):
         a = ws.cell(r, 1).value
         b = ws.cell(r, 2).value
         c = ws.cell(r, 3).value
@@ -98,7 +149,7 @@ def parse_debtors(file_obj):
     if current:
         blocks.append(current)
 
-    return blocks
+    return blocks, ledger_header
 
 
 def is_nil(block):
@@ -144,9 +195,11 @@ def style_cell(cell, bold=False, color=None, align=None, numfmt=None, fill=None,
         cell.border = FULL_BORDER
 
 
-def build_workbook(block):
+def build_workbook(block, ledger_header=None):
     """Build a single-debtor statement workbook, formatted to match the updated
-    R R Metal reference file: header row first, title row second, full thin borders."""
+    R R Metal reference file: an optional 6-row company/report header block
+    (extracted from the uploaded ledger, if present), then the column-header
+    row, then the debtor's own title row, full thin borders throughout."""
     title = clean_name(block['raw_name'])
 
     wb = Workbook()
@@ -159,31 +212,96 @@ def build_workbook(block):
     ws.column_dimensions['D'].width = 11.29
     ws.column_dimensions['E'].width = 12.86
 
-    # Row 1: Header
+    offset = 0
+    if ledger_header:
+        # Rows 1-6: company name/FY, address/date-range, country, a blank
+        # spacer, the report title, and the period caption. Matches the R R
+        # Metal reference file's rows 1-6 exactly - including that, unlike
+        # the rest of the sheet, these rows have NO border and NO fill;
+        # only the labeled cells (A and C) carry real font styling, the
+        # rest of each merged region is just plain default Calibri 11.
+        def _plain(cell):
+            cell.font = Font(name='Calibri', size=11)
+
+        ws.merge_cells('A1:B1')
+        ws['A1'] = ledger_header.get('company_name')
+        ws['A1'].font = Font(name='Arial', size=12, bold=True)
+        _plain(ws['B1'])
+
+        ws.merge_cells('C1:E1')
+        ws['C1'] = ledger_header.get('fy_label')
+        ws['C1'].font = Font(name='Arial', size=12, bold=True)
+        ws['C1'].alignment = Alignment(horizontal='right')
+        ws['C1'].number_format = ACCT_FMT
+        _plain(ws['D1']); _plain(ws['E1'])
+
+        ws.merge_cells('A2:B2')
+        ws['A2'] = ledger_header.get('address')
+        ws['A2'].font = Font(name='Calibri', size=10)
+        _plain(ws['B2'])
+
+        ws.merge_cells('C2:E2')
+        ws['C2'] = ledger_header.get('date_range')
+        ws['C2'].font = Font(name='Calibri', size=10)
+        ws['C2'].alignment = Alignment(horizontal='right')
+        ws['C2'].number_format = ACCT_FMT
+        _plain(ws['D2']); _plain(ws['E2'])
+
+        ws.merge_cells('A3:B3')
+        ws['A3'] = ledger_header.get('country')
+        ws['A3'].font = Font(name='Calibri', size=10)
+        _plain(ws['B3'])
+
+        ws.merge_cells('C3:D3')
+        ws['C3'].font = Font(name='Calibri', size=10)
+        ws['C3'].alignment = Alignment(horizontal='right')
+        ws['C3'].number_format = ACCT_FMT
+        _plain(ws['E3'])
+
+        ws.merge_cells('A4:E4')
+        ws['A4'].font = Font(name='Calibri', size=7.5, bold=True)
+        ws['A4'].alignment = Alignment(horizontal='center')
+
+        ws.merge_cells('A5:E5')
+        ws['A5'] = ledger_header.get('report_title')
+        ws['A5'].font = Font(name='Calibri', size=12, bold=True)
+        ws['A5'].alignment = Alignment(horizontal='center')
+
+        ws.merge_cells('A6:E6')
+        ws['A6'] = ledger_header.get('period_caption')
+        ws['A6'].font = Font(name='Calibri', size=10)
+        ws['A6'].alignment = Alignment(horizontal='center')
+
+        offset = 6
+
+    # Column headers
+    header_row = offset + 1
     headers = ['Date', 'Particulars', 'Debit', 'Credit', 'Balance']
     for col, text in enumerate(headers, start=1):
-        cell = ws.cell(1, col, text)
+        cell = ws.cell(header_row, col, text)
         align = 'right' if col in (3, 4, 5) else None
         style_cell(cell, bold=True, color='FF000000', align=align, fill=HEADER_FILL,
                    numfmt=ACCT_FMT if col in (3, 4, 5) else None)
 
-    # Row 2: Title + running-balance seed
-    ws.merge_cells('A2:D2')
-    ws['A2'] = title
-    style_cell(ws['A2'], bold=True, color='FF0000FF', align='center', border=False, fill='FFFFFFFF')
-    ws['A2'].border = Border(top=THIN, bottom=THIN, left=THIN, right=None)
-    for coord in ('B2', 'C2'):
+    # Title row + running-balance seed
+    title_row = offset + 2
+    ws.merge_cells(f'A{title_row}:D{title_row}')
+    ws[f'A{title_row}'] = title
+    style_cell(ws[f'A{title_row}'], bold=True, color='FF0000FF', align='center', border=False, fill='FFFFFFFF')
+    ws[f'A{title_row}'].border = Border(top=THIN, bottom=THIN, left=THIN, right=None)
+    for col_letter in ('B', 'C'):
+        coord = f'{col_letter}{title_row}'
         ws[coord].border = Border(top=THIN, bottom=THIN, left=None, right=None)
         ws[coord].font = Font(name='Arial', size=10)
         ws[coord].fill = PatternFill('solid', start_color='FFFFFFFF', end_color='FFFFFFFF')
-    ws['D2'].border = Border(top=THIN, bottom=THIN, left=None, right=THIN)
-    ws['D2'].font = Font(name='Arial', size=10)
-    ws['D2'].fill = PatternFill('solid', start_color='FFFFFFFF', end_color='FFFFFFFF')
+    ws[f'D{title_row}'].border = Border(top=THIN, bottom=THIN, left=None, right=THIN)
+    ws[f'D{title_row}'].font = Font(name='Arial', size=10)
+    ws[f'D{title_row}'].fill = PatternFill('solid', start_color='FFFFFFFF', end_color='FFFFFFFF')
 
-    ws['E2'] = 0
-    style_cell(ws['E2'], align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
+    ws[f'E{title_row}'] = 0
+    style_cell(ws[f'E{title_row}'], align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
 
-    row = 3
+    row = title_row + 1
     if block['opening'] is not None:
         ws.cell(row, 2, 'Opening Balance...')
         ws.cell(row, 3, block['opening'])
@@ -215,7 +333,7 @@ def build_workbook(block):
         row += 1
 
     last_row = row - 1
-    if last_row >= 3:
+    if last_row >= title_row + 1:
         style_cell(ws.cell(last_row, 5), bold=True, align='right', numfmt=ACCT_FMT, fill='FFFFFFFF')
 
     buf = io.BytesIO()
@@ -278,16 +396,24 @@ if uploaded_file is not None:
     if "debtor_blocks" not in st.session_state or st.session_state.get("debtor_file_name") != uploaded_file.name:
         with st.spinner("Reading and parsing the ledger..."):
             try:
-                st.session_state.debtor_blocks = parse_debtors(uploaded_file)
+                st.session_state.debtor_blocks, st.session_state.ledger_header = parse_debtors(uploaded_file)
                 st.session_state.debtor_file_name = uploaded_file.name
             except Exception as e:
                 st.error(f"Failed to read the file: {e}")
                 st.stop()
 
     blocks = st.session_state.debtor_blocks
+    ledger_header = st.session_state.get("ledger_header")
     total = len(blocks)
     non_nil_blocks = [b for b in blocks if not is_nil(b)]
     nil_count = total - len(non_nil_blocks)
+
+    if ledger_header:
+        st.caption(
+            f"📋 Detected a company/report header block in the uploaded ledger "
+            f"({ledger_header.get('company_name', '').strip()}) — this will be "
+            f"reproduced at the top of every generated statement."
+        )
 
     st.success(
         f"✅ Parsed {total} debtors — {nil_count} had a nil balance and were removed, "
@@ -415,7 +541,7 @@ if uploaded_file is not None:
 
                     used_names = {}
                     for _, r in df_range.iterrows():
-                        file_buf, title = build_workbook(r['_block'])
+                        file_buf, title = build_workbook(r['_block'], ledger_header)
                         fname = sanitize_filename(title)
                         if fname in used_names:
                             used_names[fname] += 1
