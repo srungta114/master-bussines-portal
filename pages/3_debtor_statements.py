@@ -563,3 +563,180 @@ if uploaded_file is not None:
         )
 else:
     st.info("Upload your Debtors Ledger export to get started.")
+
+
+# --- 10. BALANCE CONFIRMATION PDF SPLITTER ---
+st.divider()
+st.header("📄 Balance Confirmation PDF Splitter")
+st.write(
+    "Upload a consolidated Balance Confirmation PDF (one confirmation letter + "
+    "ledger per debtor, all in a single file). This will drop any debtor with "
+    "**both** a zero closing balance **and** a fiscal-year turnover under "
+    "Rs 100,000, then split the rest into one PDF per debtor — keeping the "
+    "exact same letter + ledger format as the original."
+)
+
+bc_pdf = st.file_uploader("Upload Balance Confirmation PDF", type=["pdf"], key="bc_pdf_uploader")
+
+TURNOVER_THRESHOLD = 100000
+
+
+def parse_balance_confirmation_pdf(file_obj):
+    """Splits the consolidated PDF into per-debtor page ranges and pulls out
+    each debtor's name, turnover ('Total Transaction RS'), and closing
+    balance ('Current Balance till date') from their letter page.
+
+    Uses the pdftotext CLI rather than a Python PDF library for the text
+    extraction step - on a large consolidated file (this kind of export can
+    run to 1000+ pages) a pure-Python page-by-page extraction library holds
+    far more in memory than this environment has available and gets killed;
+    pdftotext streams through the file instead."""
+    import subprocess
+    import tempfile
+    import os
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(file_obj.read())
+        tmp_path = tmp.name
+
+    try:
+        result = subprocess.run(
+            ["pdftotext", "-layout", tmp_path, "-"],
+            capture_output=True, text=True, check=True,
+        )
+        full_text = result.stdout
+    finally:
+        os.unlink(tmp_path)
+
+    pages_text = full_text.split("\x0c")
+    if pages_text and pages_text[-1].strip() == "":
+        pages_text = pages_text[:-1]
+
+    debtor_starts = []
+    for i, p in enumerate(pages_text):
+        m = re.search(r'^M/s (.+)$', p, re.MULTILINE)
+        if m:
+            debtor_starts.append((i, m.group(1).strip()))
+
+    records = []
+    for idx, (page_i, name) in enumerate(debtor_starts):
+        page_text = pages_text[page_i]
+
+        turnover_m = re.search(r'Total Transaction RS:\s*([\d,]+\.?\d*)', page_text)
+        turnover = float(turnover_m.group(1).replace(',', '')) if turnover_m else 0.0
+
+        bal_m = re.search(r'Current Balance till date:\s*RS\s*([\d,]+\.?\d*)\s*(Dr|Cr)', page_text)
+        if bal_m:
+            val = float(bal_m.group(1).replace(',', ''))
+            closing_balance = -val if bal_m.group(2) == 'Cr' else val
+        else:
+            closing_balance = None
+
+        pan_m = re.search(r'PAN No\.:\s*(\S*)', page_text)
+        pan = pan_m.group(1) if pan_m else ''
+
+        end_page = debtor_starts[idx + 1][0] - 1 if idx + 1 < len(debtor_starts) else len(pages_text) - 1
+
+        records.append({
+            'name': name,
+            'pan': pan,
+            'start_page': page_i,
+            'end_page': end_page,
+            'turnover': turnover,
+            'closing_balance': closing_balance,
+        })
+
+    return records
+
+
+if bc_pdf is not None:
+    if ("bc_records" not in st.session_state
+            or st.session_state.get("bc_file_name") != bc_pdf.name):
+        with st.spinner("Reading the PDF and locating each debtor's block..."):
+            try:
+                st.session_state.bc_records = parse_balance_confirmation_pdf(bc_pdf)
+                st.session_state.bc_file_name = bc_pdf.name
+                bc_pdf.seek(0)
+                st.session_state.bc_pdf_bytes = bc_pdf.read()
+            except Exception as e:
+                st.error(f"Failed to read the PDF: {e}")
+                st.stop()
+
+    bc_records = st.session_state.bc_records
+    st.success(f"✅ Found {len(bc_records)} debtors in the uploaded PDF.")
+
+    missing_balance = [r for r in bc_records if r['closing_balance'] is None]
+    if missing_balance:
+        st.warning(
+            f"⚠️ Couldn't find a closing balance for {len(missing_balance)} debtor(s) — "
+            f"they'll be kept by default rather than risk dropping them incorrectly: "
+            + ", ".join(r['name'] for r in missing_balance[:10])
+            + ("..." if len(missing_balance) > 10 else "")
+        )
+
+    bc_excluded = [
+        r for r in bc_records
+        if r['closing_balance'] == 0 and r['turnover'] < TURNOVER_THRESHOLD
+    ]
+    bc_kept = [r for r in bc_records if r not in bc_excluded]
+
+    c1, c2 = st.columns(2)
+    c1.metric("Debtors Kept", len(bc_kept))
+    c2.metric("Debtors Removed (zero balance + turnover < 100,000)", len(bc_excluded))
+
+    bc_df = pd.DataFrame([
+        {
+            'Name': r['name'],
+            'PAN': r['pan'],
+            'Turnover': r['turnover'],
+            'Closing Balance': r['closing_balance'],
+            'Pages': r['end_page'] - r['start_page'] + 1,
+        }
+        for r in bc_kept
+    ])
+    st.dataframe(
+        bc_df.style.format({'Turnover': '{:,.2f}', 'Closing Balance': '{:,.2f}'}),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if st.button("⚙️ Split PDF Into Per-Debtor Files", key="bc_split_button"):
+        with st.spinner(f"Splitting into {len(bc_kept)} individual PDFs..."):
+            from pypdf import PdfReader, PdfWriter
+
+            reader = PdfReader(io.BytesIO(st.session_state.bc_pdf_bytes))
+
+            zip_buf = io.BytesIO()
+            used_names = {}
+            with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                progress = st.progress(0)
+                for i, r in enumerate(bc_kept):
+                    writer = PdfWriter()
+                    for p in range(r['start_page'], r['end_page'] + 1):
+                        writer.add_page(reader.pages[p])
+
+                    out_buf = io.BytesIO()
+                    writer.write(out_buf)
+                    out_buf.seek(0)
+
+                    fname = sanitize_filename(r['name'])
+                    if fname in used_names:
+                        used_names[fname] += 1
+                        fname = f"{fname} ({used_names[fname]})"
+                    else:
+                        used_names[fname] = 0
+
+                    zf.writestr(f"{fname}.pdf", out_buf.getvalue())
+                    progress.progress((i + 1) / len(bc_kept))
+            zip_buf.seek(0)
+
+        st.success("🎉 All balance confirmation PDFs are ready!")
+        st.download_button(
+            label="⬇️ Download Per-Debtor Confirmations (.zip)",
+            data=zip_buf,
+            file_name="Balance_Confirmations_By_Debtor.zip",
+            mime="application/zip",
+            key="bc_download_button",
+        )
+else:
+    st.info("Upload a Balance Confirmation PDF to get started.")
