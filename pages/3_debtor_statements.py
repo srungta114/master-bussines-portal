@@ -632,7 +632,9 @@ def parse_balance_confirmation_pdf(file_obj):
         else:
             closing_balance = None
 
-        pan_m = re.search(r'PAN No\.:\s*(\S*)', page_text)
+        name_match = re.search(r'^M/s .+$', page_text, re.MULTILINE)
+        text_after_name = page_text[name_match.end():] if name_match else page_text
+        pan_m = re.search(r'PAN No\.:\s*(\S*)', text_after_name)
         pan = pan_m.group(1) if pan_m else ''
 
         end_page = debtor_starts[idx + 1][0] - 1 if idx + 1 < len(debtor_starts) else len(pages_text) - 1
@@ -647,6 +649,73 @@ def parse_balance_confirmation_pdf(file_obj):
         })
 
     return records
+
+
+def get_highlighted_names(file_obj):
+    """Reads an Excel file and returns the set of (uppercased, trimmed) text
+    values found in any cell that has a solid, non-white/non-default fill -
+    i.e. manually highlighted in Excel. Checks every sheet, since the user
+    might not have the debtor names on the first one."""
+    wb = load_workbook(file_obj, data_only=True)
+    names = set()
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                if cell.value is None or not isinstance(cell.value, str):
+                    continue
+                fill = cell.fill
+                if fill is None or fill.patternType != 'solid':
+                    continue
+                fg = fill.fgColor
+                rgb = fg.rgb if fg else None
+                is_theme_colored = bool(fg) and getattr(fg, 'type', None) == 'theme'
+                is_rgb_colored = rgb not in (None, '00000000', 'FFFFFFFF')
+                if is_rgb_colored or is_theme_colored:
+                    names.add(cell.value.strip().upper())
+    return names
+
+
+def build_bc_summary_workbook(records):
+    """Excel summary of the selected (kept) debtors from the Balance
+    Confirmation PDF, including their final (closing) balance."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Summary'
+
+    widths = {'A': 45, 'B': 16, 'C': 16, 'D': 16}
+    for col, w in widths.items():
+        ws.column_dimensions[col].width = w
+
+    headers = ['Debtor Name', 'PAN', 'Turnover', 'Final Balance']
+    for col, text in enumerate(headers, start=1):
+        cell = ws.cell(1, col, text)
+        align = 'right' if col in (3, 4) else None
+        style_cell(cell, bold=True, align=align, fill=HEADER_FILL)
+
+    row = 2
+    for r in records:
+        ws.cell(row, 1, r['name'])
+        style_cell(ws.cell(row, 1))
+        ws.cell(row, 2, r['pan'])
+        style_cell(ws.cell(row, 2))
+        ws.cell(row, 3, r['turnover'])
+        style_cell(ws.cell(row, 3), align='right', numfmt=ACCT_FMT)
+        ws.cell(row, 4, r['closing_balance'])
+        style_cell(ws.cell(row, 4), align='right', numfmt=ACCT_FMT)
+        row += 1
+
+    total_row = row
+    ws.cell(total_row, 1, 'TOTAL')
+    style_cell(ws.cell(total_row, 1), bold=True)
+    ws.cell(total_row, 3, f'=SUM(C2:C{row-1})')
+    style_cell(ws.cell(total_row, 3), bold=True, align='right', numfmt=ACCT_FMT)
+    ws.cell(total_row, 4, f'=SUM(D2:D{row-1})')
+    style_cell(ws.cell(total_row, 4), bold=True, align='right', numfmt=ACCT_FMT)
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
 
 
 if bc_pdf is not None:
@@ -674,15 +743,48 @@ if bc_pdf is not None:
             + ("..." if len(missing_balance) > 10 else "")
         )
 
-    bc_excluded = [
+    bc_auto_excluded = [
         r for r in bc_records
         if r['closing_balance'] == 0 and r['turnover'] < TURNOVER_THRESHOLD
     ]
-    bc_kept = [r for r in bc_records if r not in bc_excluded]
+    bc_after_auto_filter = [r for r in bc_records if r not in bc_auto_excluded]
 
-    c1, c2 = st.columns(2)
+    st.subheader("🚫 Optional: Skip Specific Debtors")
+    st.caption(
+        "Upload an Excel file with some debtor names highlighted (any solid "
+        "fill color, in any sheet/column). Those debtors will be skipped "
+        "from the final list and split PDFs, on top of the balance/turnover "
+        "filter above."
+    )
+    exclusion_file = st.file_uploader(
+        "Upload Excel with highlighted debtors to skip (optional)",
+        type=["xlsx"],
+        key="bc_exclusion_uploader",
+    )
+
+    bc_manually_excluded = []
+    bc_kept = bc_after_auto_filter
+    if exclusion_file is not None:
+        try:
+            highlighted_names = get_highlighted_names(exclusion_file)
+            bc_manually_excluded = [
+                r for r in bc_after_auto_filter
+                if r['name'].strip().upper() in highlighted_names
+            ]
+            bc_kept = [r for r in bc_after_auto_filter if r not in bc_manually_excluded]
+            if highlighted_names and not bc_manually_excluded:
+                st.warning(
+                    "Found highlighted cells, but none of the names matched a debtor "
+                    "in this PDF — check that the highlighted text matches the debtor "
+                    "names exactly."
+                )
+        except Exception as e:
+            st.error(f"Failed to read the exclusion file: {e}")
+
+    c1, c2, c3 = st.columns(3)
     c1.metric("Debtors Kept", len(bc_kept))
-    c2.metric("Debtors Removed (zero balance + turnover < 100,000)", len(bc_excluded))
+    c2.metric("Removed (zero balance + turnover < 100,000)", len(bc_auto_excluded))
+    c3.metric("Removed (manually highlighted)", len(bc_manually_excluded))
 
     bc_df = pd.DataFrame([
         {
@@ -709,6 +811,9 @@ if bc_pdf is not None:
             zip_buf = io.BytesIO()
             used_names = {}
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                summary_buf = build_bc_summary_workbook(bc_kept)
+                zf.writestr("0_Summary.xlsx", summary_buf.getvalue())
+
                 progress = st.progress(0)
                 for i, r in enumerate(bc_kept):
                     writer = PdfWriter()
@@ -730,9 +835,9 @@ if bc_pdf is not None:
                     progress.progress((i + 1) / len(bc_kept))
             zip_buf.seek(0)
 
-        st.success("🎉 All balance confirmation PDFs are ready!")
+        st.success("🎉 All balance confirmation PDFs and the summary sheet are ready!")
         st.download_button(
-            label="⬇️ Download Per-Debtor Confirmations (.zip)",
+            label="⬇️ Download Per-Debtor Confirmations + Summary (.zip)",
             data=zip_buf,
             file_name="Balance_Confirmations_By_Debtor.zip",
             mime="application/zip",
