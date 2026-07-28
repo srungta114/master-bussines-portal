@@ -581,12 +581,40 @@ bc_pdf = st.file_uploader("Upload Balance Confirmation PDF", type=["pdf"], key="
 TURNOVER_THRESHOLD = 100000
 
 
-def add_signature_to_page(page, signature_bytes, position_info, sig_height=45, sig_width=130, gap=4):
-    """Merges a signature image onto a single PDF page, bottom-left,
-    positioned just above the 'For A S CONCERN...' line. position_info is
-    (for_line_top, page_height, page_width) as measured by pdfplumber
-    (top-down coordinates) - converted here to PDF's bottom-up coordinate
-    system for placement."""
+def make_signature_background_transparent(image_bytes):
+    """Scanned signatures/stamps usually come on a white background, which
+    otherwise renders as an opaque white box covering whatever text sits
+    underneath it on the PDF. Converts near-white pixels to transparent,
+    with a smooth luminance-based falloff (rather than a hard on/off cutoff)
+    so anti-aliased stroke edges blend in cleanly instead of leaving a
+    jagged cutout around the ink."""
+    from PIL import Image as _Image
+    import io as _io
+
+    img = _Image.open(_io.BytesIO(image_bytes)).convert("RGBA")
+    pixels = img.load()
+    w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b, a = pixels[x, y]
+            luminance = 0.299 * r + 0.587 * g + 0.114 * b
+            new_alpha = max(0, min(255, int(255 - luminance)))
+            new_alpha = min(255, int(new_alpha * 1.6))  # a bit more contrast so faint scan artifacts fade out
+            pixels[x, y] = (r, g, b, new_alpha)
+
+    out = _io.BytesIO()
+    img.save(out, format="PNG")
+    return out.getvalue()
+
+
+def add_signature_to_page(page, transparent_signature_bytes, sig_width, sig_height, position_info, gap=4):
+    """Merges an ALREADY-transparent-background signature image onto a
+    single PDF page, bottom-left, using its real aspect ratio (computed
+    once by the caller, not per-page). Positioned just above the
+    'For A S CONCERN...' line; a slight overlap with that line if the
+    signature is tall is fine. position_info is (for_line_top, page_height,
+    page_width), top-down coordinates, converted here to PDF's bottom-up
+    coordinate system."""
     import io as _io
     from pypdf import PdfReader as _PdfReader
     from reportlab.pdfgen import canvas as _canvas
@@ -598,8 +626,8 @@ def add_signature_to_page(page, signature_bytes, position_info, sig_height=45, s
 
     buf = _io.BytesIO()
     c = _canvas.Canvas(buf, pagesize=(page_width, page_height))
-    c.drawImage(_ImageReader(_io.BytesIO(signature_bytes)), x, y,
-                width=sig_width, height=sig_height, preserveAspectRatio=True, mask='auto')
+    c.drawImage(_ImageReader(_io.BytesIO(transparent_signature_bytes)), x, y,
+                width=sig_width, height=sig_height, mask='auto')
     c.save()
     buf.seek(0)
     overlay_page = _PdfReader(buf).pages[0]
@@ -863,12 +891,24 @@ if bc_pdf is not None:
             # letters) is fine, and it skips an expensive per-page geometry
             # scan that isn't needed when a few points of slack don't matter.
             signature_position = None
+            transparent_signature_bytes = None
+            sig_width = sig_height = None
             if signature_bytes:
+                from PIL import Image as _Image
+
                 first_page_box = reader.pages[bc_kept[0]['start_page']].mediabox
                 page_width = float(first_page_box.width)
                 page_height = float(first_page_box.height)
                 FOR_LINE_TOP = 566  # a couple points below the max observed (565.03)
                 signature_position = (FOR_LINE_TOP, page_height, page_width)
+
+                # Processed once here, not per-debtor - the same signature
+                # image is reused for all ~300 files, so there's no reason
+                # to redo the pixel-by-pixel transparency conversion 300 times.
+                transparent_signature_bytes = make_signature_background_transparent(signature_bytes)
+                src_img = _Image.open(io.BytesIO(transparent_signature_bytes))
+                sig_height = 100
+                sig_width = sig_height * (src_img.width / src_img.height)
 
             zip_buf = io.BytesIO()
             used_names = {}
@@ -883,7 +923,7 @@ if bc_pdf is not None:
 
                     if signature_position:
                         first_page = add_signature_to_page(
-                            first_page, signature_bytes, signature_position
+                            first_page, transparent_signature_bytes, sig_width, sig_height, signature_position
                         )
 
                     writer.add_page(first_page)
