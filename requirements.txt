@@ -5,3 +5,4 @@ google-auth
 openpyxl
 st-gsheets-connection
 pypdf
+reportlab
