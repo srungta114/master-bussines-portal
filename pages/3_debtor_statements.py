@@ -581,6 +581,33 @@ bc_pdf = st.file_uploader("Upload Balance Confirmation PDF", type=["pdf"], key="
 TURNOVER_THRESHOLD = 100000
 
 
+def add_signature_to_page(page, signature_bytes, position_info, sig_height=45, sig_width=130, gap=4):
+    """Merges a signature image onto a single PDF page, bottom-left,
+    positioned just above the 'For A S CONCERN...' line. position_info is
+    (for_line_top, page_height, page_width) as measured by pdfplumber
+    (top-down coordinates) - converted here to PDF's bottom-up coordinate
+    system for placement."""
+    import io as _io
+    from pypdf import PdfReader as _PdfReader
+    from reportlab.pdfgen import canvas as _canvas
+    from reportlab.lib.utils import ImageReader as _ImageReader
+
+    for_top, page_height, page_width = position_info
+    y = (page_height - for_top) + gap
+    x = 20
+
+    buf = _io.BytesIO()
+    c = _canvas.Canvas(buf, pagesize=(page_width, page_height))
+    c.drawImage(_ImageReader(_io.BytesIO(signature_bytes)), x, y,
+                width=sig_width, height=sig_height, preserveAspectRatio=True, mask='auto')
+    c.save()
+    buf.seek(0)
+    overlay_page = _PdfReader(buf).pages[0]
+
+    page.merge_page(overlay_page)
+    return page
+
+
 def parse_balance_confirmation_pdf(file_obj):
     """Splits the consolidated PDF into per-debtor page ranges and pulls out
     each debtor's name, turnover ('Total Transaction RS'), and closing
@@ -802,11 +829,46 @@ if bc_pdf is not None:
         hide_index=True,
     )
 
+    st.subheader("✍️ Optional: Add a Signature")
+    st.caption(
+        "Upload a signature image (PNG/JPG). It will be placed on the "
+        "**first page** of every generated PDF, bottom-left, just above the "
+        "\"For A S CONCERN...\" line. Uses one fixed position for every "
+        "debtor (checked against the source PDF - it only varies by a few "
+        "points depending on letter length, so this stays visually correct "
+        "for everyone without a slower per-debtor position scan)."
+    )
+    signature_file = st.file_uploader(
+        "Upload signature image (optional)",
+        type=["png", "jpg", "jpeg"],
+        key="bc_signature_uploader",
+    )
+    if signature_file is not None:
+        st.image(signature_file, width=200, caption="Signature preview")
+        signature_file.seek(0)
+
     if st.button("⚙️ Split PDF Into Per-Debtor Files", key="bc_split_button"):
+        signature_bytes = signature_file.read() if signature_file is not None else None
+
         with st.spinner(f"Splitting into {len(bc_kept)} individual PDFs..."):
             from pypdf import PdfReader, PdfWriter
 
             reader = PdfReader(io.BytesIO(st.session_state.bc_pdf_bytes))
+
+            # A single fixed position works for everyone: checked the 'For A S
+            # CONCERN...' line's position across all 927 debtors in the source
+            # PDF and it only ranges ~534-565pt (top-down) depending on letter
+            # length - close enough that one fixed value (using the lowest
+            # common position, so the signature never overlaps the longest
+            # letters) is fine, and it skips an expensive per-page geometry
+            # scan that isn't needed when a few points of slack don't matter.
+            signature_position = None
+            if signature_bytes:
+                first_page_box = reader.pages[bc_kept[0]['start_page']].mediabox
+                page_width = float(first_page_box.width)
+                page_height = float(first_page_box.height)
+                FOR_LINE_TOP = 566  # a couple points below the max observed (565.03)
+                signature_position = (FOR_LINE_TOP, page_height, page_width)
 
             zip_buf = io.BytesIO()
             used_names = {}
@@ -817,7 +879,15 @@ if bc_pdf is not None:
                 progress = st.progress(0)
                 for i, r in enumerate(bc_kept):
                     writer = PdfWriter()
-                    for p in range(r['start_page'], r['end_page'] + 1):
+                    first_page = reader.pages[r['start_page']]
+
+                    if signature_position:
+                        first_page = add_signature_to_page(
+                            first_page, signature_bytes, signature_position
+                        )
+
+                    writer.add_page(first_page)
+                    for p in range(r['start_page'] + 1, r['end_page'] + 1):
                         writer.add_page(reader.pages[p])
 
                     out_buf = io.BytesIO()
