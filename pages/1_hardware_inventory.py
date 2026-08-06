@@ -14,6 +14,13 @@ if "password_correct" not in st.session_state or not st.session_state["password_
     st.info("Please click the Main Portal page in your sidebar to log in and reconnect to the database.")
     st.stop()  # This halts the script here so it doesn't crash on the next lines!
 
+# Page-level access check. Hiding this page from the sidebar nav (done in
+# app.py) only controls what's SHOWN - it doesn't stop someone who already
+# has or guesses this page's direct URL. This is the actual enforcement.
+if "inventory" not in st.session_state.get("allowed_pages", []):
+    st.error("🔒 You don't have access to this page. Contact an administrator if you need it.")
+    st.stop()
+
 
 # --- SECURE CREDENTIALS & AUTHENTICATION ---
 # This page uses its OWN spreadsheet (Hardware Inventory DB), separate from the
