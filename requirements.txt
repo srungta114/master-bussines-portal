@@ -8,3 +8,4 @@ reportlab
 streamlit>=1.42.0
 google-cloud-firestore
 Authlib
+httpx
