@@ -8,7 +8,7 @@ st.set_page_config(page_title="Business Portal", layout="wide", page_icon="🏢"
 
 # --- 2. LOGIN (individual Google accounts, replaces the old shared password) ---
 if not st.user.is_logged_in:
-    st.title("🔒 Business Portal")
+    st.title("🔒 A S Concern Business Portal")
     st.write("Please log in with your Google account to continue.")
     if st.button("Log in with Google", type="primary"):
         st.login("google")
@@ -47,7 +47,11 @@ if "sh" not in st.session_state:
 user_email = st.user.email.strip().lower()
 st.session_state.user_email = user_email
 
-# --- 4. ROLE LOOKUP (with bootstrap-admin support for first-ever login) ---
+# --- 4. ROLE + PAGE-ACCESS LOOKUP (with bootstrap-admin support for first-ever login) ---
+# Canonical page keys - used both for the checkboxes in Manage Users and for
+# each tool page's own access check.
+ALL_PAGE_KEYS = ["inventory", "costing", "debtors"]
+
 if "user_role" not in st.session_state:
     user_ref = db.collection("users").document(user_email)
     user_doc = user_ref.get()
@@ -58,6 +62,12 @@ if "user_role" not in st.session_state:
             st.error("🔒 Your access has been disabled. Please contact an administrator.")
             st.stop()
         st.session_state.user_role = data.get("role", "staff")
+        # Admins implicitly get every page regardless of what's stored;
+        # staff only get whatever pages an admin explicitly checked for them.
+        st.session_state.allowed_pages = (
+            ALL_PAGE_KEYS if st.session_state.user_role == "admin"
+            else data.get("pages", [])
+        )
         user_ref.update({"last_login": datetime.now(timezone.utc)})
     else:
         bootstrap_admins = [e.strip().lower() for e in st.secrets.get("bootstrap_admins", [])]
@@ -65,11 +75,13 @@ if "user_role" not in st.session_state:
             user_ref.set({
                 "email": user_email,
                 "role": "admin",
+                "pages": ALL_PAGE_KEYS,
                 "active": True,
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             })
             st.session_state.user_role = "admin"
+            st.session_state.allowed_pages = ALL_PAGE_KEYS
         else:
             st.error(
                 "🔒 Your account hasn't been granted access to this portal yet. "
@@ -80,6 +92,7 @@ if "user_role" not in st.session_state:
             st.stop()
 
 user_role = st.session_state.user_role
+allowed_pages = st.session_state.allowed_pages
 # Compatibility shim: the existing Hardware Inventory / Debtor Statements pages
 # still check this exact flag from the old shared-password login. Only set
 # once we've actually confirmed the user is authorized above - not before.
@@ -91,6 +104,18 @@ def require_admin():
     """Call at the top of any admin-only section. Stops the page for non-admins."""
     if st.session_state.get("user_role") != "admin":
         st.warning("🔒 This action requires admin access. Contact an administrator if you need this.")
+        st.stop()
+
+
+def require_page_access(page_key):
+    """Call at the top of each tool page with its own key (e.g. 'inventory').
+    This is the REAL enforcement point - hiding a page from the sidebar nav
+    only affects what's shown, it doesn't stop someone who already knows or
+    guesses the direct URL (Streamlit still serves any page in pages/ by
+    path regardless of navigation visibility). Every page needs this check
+    itself, not just app.py filtering the nav list."""
+    if page_key not in st.session_state.get("allowed_pages", []):
+        st.error("🔒 You don't have access to this page. Contact an administrator if you need it.")
         st.stop()
 
 
@@ -118,15 +143,23 @@ with st.sidebar:
 st.title("🏢 Master Business Portal")
 st.write("Welcome! Please select a tool from the sidebar menu.")
 
-inventory_page = st.Page("pages/1_hardware_inventory.py", title="Hardware Inventory", icon="📦")
-costing_page = st.Page("pages/2_costing_tool.py", title="Costing Tool", icon="💰")
-debtors_page = st.Page("pages/3_debtor_statements.py", title="Debtor Statements", icon="🧾")
+PAGE_DEFINITIONS = {
+    "inventory": st.Page("pages/1_hardware_inventory.py", title="Hardware Inventory", icon="📦"),
+    "costing": st.Page("pages/2_costing_tool.py", title="Costing Tool", icon="💰"),
+    "debtors": st.Page("pages/3_debtor_statements.py", title="Debtor Statements", icon="🧾"),
+}
 
-pages = [inventory_page, costing_page, debtors_page]
+# Only show pages this specific user has been granted. This controls what's
+# VISIBLE - the actual blocking of direct-URL access happens inside each
+# page via require_page_access(), since a hidden nav link alone doesn't stop
+# someone who already has or guesses the URL.
+pages = [PAGE_DEFINITIONS[key] for key in ALL_PAGE_KEYS if key in allowed_pages]
+
+if not pages and user_role != "admin":
+    st.warning("You don't currently have access to any tools. Contact an administrator.")
 
 if user_role == "admin":
-    users_page = st.Page("pages/4_manage_users.py", title="Manage Users", icon="👥")
-    pages.append(users_page)
+    pages.append(st.Page("pages/4_manage_users.py", title="Manage Users", icon="👥"))
 
 pg = st.navigation(pages)
 pg.run()
