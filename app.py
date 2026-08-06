@@ -8,7 +8,7 @@ st.set_page_config(page_title="Business Portal", layout="wide", page_icon="🏢"
 
 # --- 2. LOGIN (individual Google accounts, replaces the old shared password) ---
 if not st.user.is_logged_in:
-    st.title("🔒 A S Concern Business Portal")
+    st.title("🔒 Business Portal")
     st.write("Please log in with your Google account to continue.")
     if st.button("Log in with Google", type="primary"):
         st.login("google")
