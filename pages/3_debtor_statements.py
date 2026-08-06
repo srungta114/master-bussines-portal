@@ -13,6 +13,13 @@ if "password_correct" not in st.session_state or not st.session_state["password_
     st.info("Please click the Main Portal page in your sidebar to log in and reconnect to the database.")
     st.stop()
 
+# Page-level access check. Hiding this page from the sidebar nav (done in
+# app.py) only controls what's SHOWN - it doesn't stop someone who already
+# has or guesses this page's direct URL. This is the actual enforcement.
+if "debtors" not in st.session_state.get("allowed_pages", []):
+    st.error("🔒 You don't have access to this page. Contact an administrator if you need it.")
+    st.stop()
+
 st.title("🧾 Debtor Statement Generator")
 st.write(
     "Upload your full Debtors Ledger export. This tool will clean it up, drop any "
