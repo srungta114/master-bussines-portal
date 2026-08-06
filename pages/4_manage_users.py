@@ -19,11 +19,22 @@ st.write(
     "next time that person loads the app."
 )
 
+PAGE_LABELS = {
+    "inventory": "📦 Hardware Inventory",
+    "costing": "💰 Costing Tool",
+    "debtors": "🧾 Debtor Statements",
+}
+
 # --- ADD A NEW USER ---
 st.header("➕ Add a New User")
 with st.form("add_user_form", clear_on_submit=True):
     new_email = st.text_input("Email address (must match their Google login)").strip().lower()
     new_role = st.selectbox("Role", options=["staff", "admin"])
+    st.caption("Page access (ignored for admins - admins always get every page):")
+    new_pages = [
+        key for key, label in PAGE_LABELS.items()
+        if st.checkbox(label, key=f"new_page_{key}")
+    ]
     submitted = st.form_submit_button("Add User")
 
     if submitted:
@@ -32,11 +43,12 @@ with st.form("add_user_form", clear_on_submit=True):
         else:
             existing = db.collection("users").document(new_email).get()
             if existing.exists:
-                st.warning(f"{new_email} already has access. Edit their role in the table below instead.")
+                st.warning(f"{new_email} already has access. Edit their access in the table below instead.")
             else:
                 db.collection("users").document(new_email).set({
                     "email": new_email,
                     "role": new_role,
+                    "pages": new_pages,
                     "active": True,
                     "created_at": datetime.now(timezone.utc),
                     "last_login": None,
@@ -97,6 +109,24 @@ else:
                 else:
                     db.collection("users").document(email).delete()
                     st.rerun()
+
+        # Page access - only meaningful for staff, since admins always get everything
+        if new_role_val == "admin":
+            st.caption("Admins have access to every page automatically.")
+        else:
+            current_pages = set(u.get("pages", []))
+            page_cols = st.columns(len(PAGE_LABELS))
+            updated_pages = set(current_pages)
+            for col, (key, label) in zip(page_cols, PAGE_LABELS.items()):
+                with col:
+                    checked = st.checkbox(label, value=key in current_pages, key=f"pages_{email}_{key}")
+                    if checked:
+                        updated_pages.add(key)
+                    else:
+                        updated_pages.discard(key)
+            if updated_pages != current_pages:
+                db.collection("users").document(email).update({"pages": sorted(updated_pages)})
+                st.rerun()
 
         st.divider()
 
