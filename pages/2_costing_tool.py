@@ -227,12 +227,23 @@ with st.expander("Search Master Database", expanded=False):
             history = item_data.get('recent_costings') or []
             if history:
                 hist_df = pd.DataFrame(history)
+
+                # Landed price without VAT (Landed_Rate_Purchase already includes 13% VAT)
+                if 'Landed_Rate_Purchase' in hist_df.columns:
+                    hist_df['Landed_Price_ExVAT'] = pd.to_numeric(
+                        hist_df['Landed_Rate_Purchase'], errors='coerce'
+                    ) / 1.13
+
                 display_cols = [c for c in [
-                    'Date', 'Seller', 'Bill_No', 'Rate_Purchase',
+                    'Date', 'Seller', 'Bill_No', 'Landed_Price_ExVAT',
                     'Landed_Rate_Purchase', 'Cost_Pc', 'Qty_Purchase'
                 ] if c in hist_df.columns]
+
                 st.dataframe(
-                    hist_df[display_cols],
+                    hist_df[display_cols].rename(columns={
+                        'Landed_Price_ExVAT': 'Landed Price (Ex-VAT)',
+                        'Landed_Rate_Purchase': 'Landed Price (Incl. VAT)',
+                    }),
                     use_container_width=True,
                     hide_index=True,
                 )
