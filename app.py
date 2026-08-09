@@ -8,7 +8,7 @@ st.set_page_config(page_title="Business Portal", layout="wide", page_icon="🏢"
 
 # --- 2. LOGIN (individual Google accounts, replaces the old shared password) ---
 if not st.user.is_logged_in:
-    st.title("🔒 Business Portal")
+    st.title("🔒 A S Concern Business Portal")
     st.write("Please log in with your Google account to continue.")
     if st.button("Log in with Google", type="primary"):
         st.login("google")
@@ -52,6 +52,14 @@ st.session_state.user_email = user_email
 # each tool page's own access check.
 ALL_PAGE_KEYS = ["inventory", "costing", "debtors"]
 
+# Canonical FEATURE keys - finer-grained than pages. Someone can have access
+# to a whole page (e.g. "inventory") but still be blocked from a specific
+# risky action within it (e.g. "inventory_bulk_delete"), if that key isn't
+# in their granted permissions below. Add new keys here as new gated
+# features are built; each tool page checks its own keys with
+# require_permission().
+ALL_PERMISSION_KEYS = ["inventory_bulk_delete"]
+
 if "user_role" not in st.session_state:
     user_ref = db.collection("users").document(user_email)
     user_doc = user_ref.get()
@@ -68,6 +76,12 @@ if "user_role" not in st.session_state:
             ALL_PAGE_KEYS if st.session_state.user_role == "admin"
             else data.get("pages", [])
         )
+        # Same pattern, one level finer-grained: admins implicitly get every
+        # gated feature; staff only get whatever an admin explicitly checked.
+        st.session_state.user_permissions = (
+            ALL_PERMISSION_KEYS if st.session_state.user_role == "admin"
+            else data.get("permissions", [])
+        )
         user_ref.update({"last_login": datetime.now(timezone.utc)})
     else:
         bootstrap_admins = [e.strip().lower() for e in st.secrets.get("bootstrap_admins", [])]
@@ -76,12 +90,14 @@ if "user_role" not in st.session_state:
                 "email": user_email,
                 "role": "admin",
                 "pages": ALL_PAGE_KEYS,
+                "permissions": ALL_PERMISSION_KEYS,
                 "active": True,
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             })
             st.session_state.user_role = "admin"
             st.session_state.allowed_pages = ALL_PAGE_KEYS
+            st.session_state.user_permissions = ALL_PERMISSION_KEYS
         else:
             st.error(
                 "🔒 Your account hasn't been granted access to this portal yet. "
@@ -93,6 +109,7 @@ if "user_role" not in st.session_state:
 
 user_role = st.session_state.user_role
 allowed_pages = st.session_state.allowed_pages
+user_permissions = st.session_state.user_permissions
 # Compatibility shim: the existing Hardware Inventory / Debtor Statements pages
 # still check this exact flag from the old shared-password login. Only set
 # once we've actually confirmed the user is authorized above - not before.
@@ -116,6 +133,26 @@ def require_page_access(page_key):
     itself, not just app.py filtering the nav list."""
     if page_key not in st.session_state.get("allowed_pages", []):
         st.error("🔒 You don't have access to this page. Contact an administrator if you need it.")
+        st.stop()
+
+
+def has_permission(permission_key):
+    """Non-blocking check - use this to decide whether to even show a
+    button/section (e.g. `if has_permission(...): st.button(...)`), as
+    opposed to require_permission() which halts the page outright."""
+    return permission_key in st.session_state.get("user_permissions", [])
+
+
+def require_permission(permission_key):
+    """Call inside a specific feature/section (not necessarily the whole
+    page) that needs finer-grained gating than page-level access - e.g. a
+    user might have the 'inventory' page but not the
+    'inventory_bulk_delete' feature within it. Unlike require_page_access(),
+    this doesn't st.stop() the entire page - only use it after everything
+    else on the page that SHOULD still render for this user has already
+    been drawn, or wrap the gated section so only that section is skipped."""
+    if not has_permission(permission_key):
+        st.warning("🔒 You don't have access to this feature. Contact an administrator if you need it.")
         st.stop()
 
 
