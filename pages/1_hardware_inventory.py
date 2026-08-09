@@ -1397,70 +1397,80 @@ with tab5:
 
         st.divider()
         st.header("🗑️ Bulk Delete Bills")
-        st.caption("Select any combination of purchase and sales bills below, then delete them all in one go.")
 
-        search_term = st.text_input(
-            "Filter list (bill number, item, or date)",
-            key="bulk_delete_search",
-            placeholder="Type to narrow the list...",
-        )
-
-        bill_summary = (
-            df_filtered.groupby(['Bill_Label', 'Bill Number', 'Fiscal Year', 'Date_Str'], dropna=False)
-            .agg(
-                Items=('Item_Name', 'count'),
-                Net_Qty=('Purchase Qty', lambda s: pd.to_numeric(s, errors='coerce').sum()),
-            )
-            .reset_index()
-            .sort_values('Date_Str', ascending=False)
-        )
-        bill_summary.rename(columns={'Date_Str': 'Date', 'Net_Qty': 'Net Purchase Qty'}, inplace=True)
-
-        if search_term.strip():
-            mask = bill_summary.apply(
-                lambda r: search_term.strip().lower() in " ".join(str(v) for v in r.values).lower(),
-                axis=1,
-            )
-            bill_summary = bill_summary[mask]
-
-        if bill_summary.empty:
-            st.info("No bills match that filter.")
+        # Feature-level gate: someone can have the Hardware Inventory page
+        # but not this specific action, if an admin hasn't granted the
+        # "inventory_bulk_delete" permission for their account. Checked the
+        # same way app.py's has_permission() does (against
+        # st.session_state.user_permissions), inline rather than imported,
+        # since pages don't share app.py's function definitions directly.
+        if "inventory_bulk_delete" not in st.session_state.get("user_permissions", []):
+            st.info("🔒 Bulk deleting bills requires a permission an administrator hasn't granted your account yet.")
         else:
-            bill_summary.insert(0, "Select", False)
+            st.caption("Select any combination of purchase and sales bills below, then delete them all in one go.")
 
-            edited_summary = st.data_editor(
-                bill_summary,
-                use_container_width=True,
-                hide_index=True,
-                disabled=[c for c in bill_summary.columns if c != "Select"],
-                column_config={
-                    "Select": st.column_config.CheckboxColumn("Select", help="Check the bills you want to delete"),
-                },
-                key="bulk_delete_editor",
+            search_term = st.text_input(
+                "Filter list (bill number, item, or date)",
+                key="bulk_delete_search",
+                placeholder="Type to narrow the list...",
             )
 
-            selected_bills = edited_summary[edited_summary["Select"]]
+            bill_summary = (
+                df_filtered.groupby(['Bill_Label', 'Bill Number', 'Fiscal Year', 'Date_Str'], dropna=False)
+                .agg(
+                    Items=('Item_Name', 'count'),
+                    Net_Qty=('Purchase Qty', lambda s: pd.to_numeric(s, errors='coerce').sum()),
+                )
+                .reset_index()
+                .sort_values('Date_Str', ascending=False)
+            )
+            bill_summary.rename(columns={'Date_Str': 'Date', 'Net_Qty': 'Net Purchase Qty'}, inplace=True)
 
-            if not selected_bills.empty:
-                total_items = int(selected_bills["Items"].sum())
-                st.warning(
-                    f"⚠️ {len(selected_bills)} bill(s) selected, covering {total_items} line item(s) total. "
-                    "This cannot be undone."
+            if search_term.strip():
+                mask = bill_summary.apply(
+                    lambda r: search_term.strip().lower() in " ".join(str(v) for v in r.values).lower(),
+                    axis=1,
+                )
+                bill_summary = bill_summary[mask]
+
+            if bill_summary.empty:
+                st.info("No bills match that filter.")
+            else:
+                bill_summary.insert(0, "Select", False)
+
+                edited_summary = st.data_editor(
+                    bill_summary,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=[c for c in bill_summary.columns if c != "Select"],
+                    column_config={
+                        "Select": st.column_config.CheckboxColumn("Select", help="Check the bills you want to delete"),
+                    },
+                    key="bulk_delete_editor",
                 )
 
-                confirm = st.checkbox(
-                    f"I understand this will permanently delete these {len(selected_bills)} bill(s).",
-                    key="bulk_delete_confirm",
-                )
+                selected_bills = edited_summary[edited_summary["Select"]]
 
-                if st.button("🗑️ Delete Selected Bills", type="primary", disabled=not confirm):
-                    labels_to_delete = set(selected_bills['Bill_Label'])
-                    rows_to_delete = df_filtered[df_filtered['Bill_Label'].isin(labels_to_delete)]
-                    affected_fys = rows_to_delete['Fiscal Year'].dropna().unique().tolist() if 'Fiscal Year' in rows_to_delete.columns else []
+                if not selected_bills.empty:
+                    total_items = int(selected_bills["Items"].sum())
+                    st.warning(
+                        f"⚠️ {len(selected_bills)} bill(s) selected, covering {total_items} line item(s) total. "
+                        "This cannot be undone."
+                    )
 
-                    final_df = purchases_df.drop(index=rows_to_delete.index).copy()
-                    overwrite_purchases(final_df, only_fys=affected_fys if affected_fys else None)
+                    confirm = st.checkbox(
+                        f"I understand this will permanently delete these {len(selected_bills)} bill(s).",
+                        key="bulk_delete_confirm",
+                    )
 
-                    st.cache_data.clear()
-                    st.success(f"✅ Deleted {len(selected_bills)} bill(s) ({len(rows_to_delete)} line items).")
-                    st.rerun()
+                    if st.button("🗑️ Delete Selected Bills", type="primary", disabled=not confirm):
+                        labels_to_delete = set(selected_bills['Bill_Label'])
+                        rows_to_delete = df_filtered[df_filtered['Bill_Label'].isin(labels_to_delete)]
+                        affected_fys = rows_to_delete['Fiscal Year'].dropna().unique().tolist() if 'Fiscal Year' in rows_to_delete.columns else []
+
+                        final_df = purchases_df.drop(index=rows_to_delete.index).copy()
+                        overwrite_purchases(final_df, only_fys=affected_fys if affected_fys else None)
+
+                        st.cache_data.clear()
+                        st.success(f"✅ Deleted {len(selected_bills)} bill(s) ({len(rows_to_delete)} line items).")
+                        st.rerun()
