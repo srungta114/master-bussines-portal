@@ -1,7 +1,5 @@
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
 from datetime import datetime
 from difflib import get_close_matches
 import re
@@ -9,7 +7,10 @@ import io
 
 # --- 1. SECURITY BOUNCER ---
 # If the memory was wiped (refresh) or they bypassed the login, stop the page from crashing.
-if "password_correct" not in st.session_state or not st.session_state["password_correct"]:
+# Mirrors the Costing Tool's bouncer: "db" is the single shared Firestore
+# client cached by app.py at login, so both tools now check for the same key
+# instead of this page authenticating its own separate Sheets connection.
+if "db" not in st.session_state:
     st.warning("🔒 Connection lost or not logged in.")
     st.info("Please click the Main Portal page in your sidebar to log in and reconnect to the database.")
     st.stop()  # This halts the script here so it doesn't crash on the next lines!
@@ -20,30 +21,6 @@ if "password_correct" not in st.session_state or not st.session_state["password_
 if "inventory" not in st.session_state.get("allowed_pages", []):
     st.error("🔒 You don't have access to this page. Contact an administrator if you need it.")
     st.stop()
-
-
-# --- SECURE CREDENTIALS & AUTHENTICATION ---
-# This page uses its OWN spreadsheet (Hardware Inventory DB), separate from the
-# Costing Tool's spreadsheet cached in st.session_state.sh by app.py. We cache
-# our own connection here under a different key so it's only authenticated
-# once per session instead of on every single script rerun (every button
-# click reruns this whole file - re-authenticating each time is wasteful and
-# risks hitting Google's API rate limits under normal use).
-if "inventory_sh" not in st.session_state:
-    try:
-        gsheet_creds = st.secrets["gsheets"]
-        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_info(gsheet_creds, scopes=scopes)
-        client = gspread.authorize(creds)
-
-        # Connects exactly to your Inventory Database (distinct from the Costing Tool's sheet)
-        SHEET_ID = "1I3A79zVuSg4Gy98EgUfktYLEzJtXUc6vynSobGl2rFQ"
-        st.session_state.inventory_sh = client.open_by_key(SHEET_ID)
-    except Exception as e:
-        st.error(f"Authentication Failed: {e}")
-        st.stop()
-
-sh = st.session_state.inventory_sh
 
 # --- NEPALI FISCAL YEAR ENGINE (DYNAMIC) ---
 def get_nepali_fiscal_year(date_val):
@@ -77,47 +54,56 @@ def get_nepali_fiscal_year(date_val):
         return "Unknown"
 
 # --- GOOGLE SHEETS DYNAMIC READ/WRITE FUNCTIONS ---
+import re as _re
+
+
+def _sanitize_doc_id(name):
+    """Firestore document IDs can't contain '/' and shouldn't be empty."""
+    doc_id = _re.sub(r'[/\\]', '_', str(name).strip())
+    doc_id = doc_id[:1500]  # Firestore's document ID length limit
+    return doc_id if doc_id else "unnamed"
+
+
 @st.cache_data(ttl=10)
 def get_product_master():
+    # Shared with the Costing Tool - already migrated to Firestore there,
+    # so this just reads the same collection rather than re-migrating it.
     try:
-        records = sh.worksheet("Product_Master").get_all_records()
-        return pd.DataFrame(records)
+        db = st.session_state.db
+        docs = db.collection("product_master").stream()
+        return pd.DataFrame([d.to_dict() for d in docs])
     except Exception:
         return pd.DataFrame(columns=["Item_Name", "Purchase_Unit", "Sales_Unit", "Group"])
 
 @st.cache_data(ttl=10)
 def get_purchases():
+    # Every fiscal year's transactions live in their own subcollection at
+    # purchases_fy/{fy}/entries. A collection_group query reads across every
+    # one of those subcollections in a single call, replacing the old
+    # "loop every FY worksheet" pattern.
     try:
-        all_records = []
-        # Read from all Fiscal Year tabs
-        for ws in sh.worksheets():
-            if ws.title.startswith("FY "):
-                all_records.extend(ws.get_all_records())
-                
-        # Also read the old "Purchases" tab so you don't lose old data during migration
-        try:
-            old_ws = sh.worksheet("Purchases")
-            all_records.extend(old_ws.get_all_records())
-        except Exception:
-            pass
-            
-        return pd.DataFrame(all_records) if all_records else pd.DataFrame()
+        db = st.session_state.db
+        docs = db.collection_group("entries").stream()
+        records = [d.to_dict() for d in docs]
+        return pd.DataFrame(records) if records else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 @st.cache_data(ttl=10)
 def get_code_mapping():
     try:
-        records = sh.worksheet("Code_Mapping").get_all_records()
-        return pd.DataFrame(records)
+        db = st.session_state.db
+        docs = db.collection("code_mapping").stream()
+        return pd.DataFrame([d.to_dict() for d in docs])
     except Exception:
         return pd.DataFrame(columns=["Item Code", "Item Name", "Units"])
 
 @st.cache_data(ttl=10)
 def get_learned_mappings():
     try:
-        records = sh.worksheet("Learned_Mappings").get_all_records()
-        return pd.DataFrame(records)
+        db = st.session_state.db
+        docs = db.collection("learned_mappings").stream()
+        return pd.DataFrame([d.to_dict() for d in docs])
     except Exception:
         return pd.DataFrame(columns=["Billed_Description", "Matched_Item_Name"])
 
@@ -139,24 +125,42 @@ def _prepare_for_save(df_to_save):
     return df_save
 
 
-def _fy_to_ws_name(fy):
-    ws_name = str(fy).replace("/", "-") if pd.notna(fy) and str(fy).strip() != "Unknown" else "FY Unknown"
-    if not ws_name.startswith("FY "):
-        ws_name = "FY " + ws_name
-    return ws_name
+def _fy_to_doc_id(fy):
+    """Same naming convention as the old worksheet-name helper, now used as
+    the Firestore document ID under purchases_fy/ instead of a tab name."""
+    doc_id = str(fy).replace("/", "-") if pd.notna(fy) and str(fy).strip() != "Unknown" else "FY Unknown"
+    if not doc_id.startswith("FY "):
+        doc_id = "FY " + doc_id
+    return doc_id
+
+
+def _commit_in_batches(db, write_fn, items):
+    """Runs write_fn(batch, item) over items, committing every 400 writes
+    (Firestore batches cap at 500)."""
+    batch = db.batch()
+    count = 0
+    for item in items:
+        write_fn(batch, item)
+        count += 1
+        if count % 400 == 0:
+            batch.commit()
+            batch = db.batch()
+    batch.commit()
 
 
 def append_purchases(new_rows_df):
-    """Append-only save: adds new rows to the correct FY tab(s) WITHOUT
-    reading or rewriting any existing data in that tab.
+    """Append-only save: adds new rows as new documents in the correct FY's
+    entries subcollection WITHOUT reading or rewriting any existing data
+    there.
 
     This is the default path for anything that is genuinely new data
     (single-entry commits, bulk-upload commits with no bill being
-    replaced). It's both far faster (no need to transmit and rewrite
-    tens of thousands of existing rows just to add a handful of new
-    ones) and safe under concurrent use: two people saving at the same
-    moment simply both get appended, instead of one person's full-tab
-    rewrite silently erasing the other's just-saved transaction.
+    replaced). It's both far faster (no need to transmit and rewrite tens
+    of thousands of existing documents just to add a handful of new ones)
+    and safe under concurrent use: two people saving at the same moment
+    simply both get their own new documents, instead of one person's
+    full-collection rewrite silently erasing the other's just-saved
+    transaction.
     """
     if new_rows_df.empty:
         return
@@ -165,28 +169,19 @@ def append_purchases(new_rows_df):
     if 'Fiscal Year' not in df_save.columns:
         return
 
-    existing_ws = {ws.title: ws for ws in sh.worksheets() if ws.title.startswith("FY ")}
+    db = st.session_state.db
 
     for fy, group_df in df_save.groupby('Fiscal Year'):
-        ws_name = _fy_to_ws_name(fy)
+        fy_id = _fy_to_doc_id(fy)
+        entries_ref = db.collection("purchases_fy").document(fy_id).collection("entries")
         group_df = group_df.fillna("")
 
-        if ws_name in existing_ws:
-            ws = existing_ws[ws_name]
-            header = ws.row_values(1)
-            if header:
-                # Align new rows to the tab's existing column order so an
-                # append never silently shifts values into the wrong columns
-                aligned = group_df.reindex(columns=header, fill_value="")
-                ws.append_rows(aligned.values.tolist(), value_input_option="USER_ENTERED")
-            else:
-                data_to_write = [group_df.columns.values.tolist()] + group_df.values.tolist()
-                ws.update(values=data_to_write, range_name="A1")
-        else:
-            ws = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
-            data_to_write = [group_df.columns.values.tolist()] + group_df.values.tolist()
-            ws.update(values=data_to_write, range_name="A1")
-            existing_ws[ws_name] = ws
+        rows = [row.to_dict() for _, row in group_df.iterrows()]
+        _commit_in_batches(
+            db,
+            lambda batch, row: batch.set(entries_ref.document(), row),
+            rows,
+        )
 
 
 def overwrite_purchases(df_to_save, only_fys=None):
@@ -194,64 +189,64 @@ def overwrite_purchases(df_to_save, only_fys=None):
     remove or replace existing rows (editing a transaction, or choosing
     'Override' on a duplicate bill during bulk upload).
 
-    Unlike the old single save_purchases() this used to be, this never
-    touches every fiscal year's tab automatically - pass `only_fys` (a
-    fiscal-year string or list of them) to restrict the rewrite to just
-    the tab(s) that actually changed, so a single edited bill doesn't
-    trigger a full rewrite of every other year's untouched history.
-    If `only_fys` is None, every fiscal year present in df_to_save is
-    rewritten (used for full-dataset migrations only).
+    Mirrors the old sheet-tab clear-and-rewrite, but scoped to Firestore:
+    pass `only_fys` (a fiscal-year string or list of them) to restrict the
+    rewrite to just the FY subcollection(s) that actually changed, so a
+    single edited bill doesn't trigger a full rewrite of every other
+    year's untouched history. If `only_fys` is None, every fiscal year
+    present in df_to_save is rewritten (used for full-dataset migrations
+    only).
     """
-    if df_to_save.empty:
+    if df_to_save.empty and not only_fys:
         return
 
-    df_save = _prepare_for_save(df_to_save)
-    if 'Fiscal Year' not in df_save.columns:
-        return
+    df_save = _prepare_for_save(df_to_save) if not df_to_save.empty else df_to_save
+    db = st.session_state.db
 
     if only_fys is not None:
         if isinstance(only_fys, str):
             only_fys = [only_fys]
-        df_save = df_save[df_save['Fiscal Year'].isin(only_fys)]
+        if 'Fiscal Year' in df_save.columns:
+            df_save = df_save[df_save['Fiscal Year'].isin(only_fys)]
         target_fys = only_fys
     else:
-        target_fys = df_save['Fiscal Year'].dropna().unique().tolist()
-
-    existing_ws = {ws.title: ws for ws in sh.worksheets() if ws.title.startswith("FY ")}
+        target_fys = df_save['Fiscal Year'].dropna().unique().tolist() if 'Fiscal Year' in df_save.columns else []
 
     for fy in target_fys:
-        ws_name = _fy_to_ws_name(fy)
-        group_df = df_save[df_save['Fiscal Year'] == fy].fillna("")
+        fy_id = _fy_to_doc_id(fy)
+        entries_ref = db.collection("purchases_fy").document(fy_id).collection("entries")
 
-        if ws_name in existing_ws:
-            ws = existing_ws[ws_name]
-        else:
-            ws = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
+        # Delete every existing document in this FY's subcollection first...
+        existing_refs = [d.reference for d in entries_ref.stream()]
+        _commit_in_batches(db, lambda batch, ref: batch.delete(ref), existing_refs)
 
-        data_to_write = [group_df.columns.values.tolist()] + group_df.values.tolist() if not group_df.empty else [df_save.columns.values.tolist()]
-        ws.clear()
-        ws.update(values=data_to_write, range_name="A1")
-
-    # Clear out the old 'Purchases' tab once, so it doesn't keep duplicating
-    # data that has now been migrated into per-FY tabs. Only worth doing on
-    # a full (only_fys=None) migration pass, not on every scoped edit.
-    if only_fys is None:
-        try:
-            old_ws = sh.worksheet("Purchases")
-            old_ws.clear()
-        except Exception:
-            pass
+        # ...then write the fresh set for this FY.
+        group_df = df_save[df_save['Fiscal Year'] == fy].fillna("") if 'Fiscal Year' in df_save.columns else pd.DataFrame()
+        rows = [row.to_dict() for _, row in group_df.iterrows()]
+        _commit_in_batches(
+            db,
+            lambda batch, row: batch.set(entries_ref.document(), row),
+            rows,
+        )
 
 def save_learned_mappings(df_to_save):
-    try:
-        ws = sh.worksheet("Learned_Mappings")
-    except Exception:
-        ws = sh.add_worksheet(title="Learned_Mappings", rows="1000", cols="5")
-    
+    # Learned_Mappings is small (~400 rows), so - like the old sheet-clear
+    # approach - this fully replaces the collection each save rather than
+    # diffing it. Doc IDs are the (sanitized) billed description, so
+    # re-running with the same description overwrites in place.
+    db = st.session_state.db
+    coll_ref = db.collection("learned_mappings")
+
+    existing_refs = [d.reference for d in coll_ref.stream()]
+    _commit_in_batches(db, lambda batch, ref: batch.delete(ref), existing_refs)
+
     df_to_save = df_to_save.fillna("")
-    data_to_write = [df_to_save.columns.values.tolist()] + df_to_save.values.tolist()
-    ws.clear()
-    ws.update(values=data_to_write, range_name="A1")
+    rows = []
+    for _, row in df_to_save.iterrows():
+        billed = str(row.get("Billed_Description", "")).strip()
+        doc_ref = coll_ref.document(_sanitize_doc_id(billed)) if billed else coll_ref.document()
+        rows.append((doc_ref, row.to_dict()))
+    _commit_in_batches(db, lambda batch, item: batch.set(item[0], item[1]), rows)
 
 # Initialization
 products_df = get_product_master()
@@ -1029,7 +1024,8 @@ with tab2:
                 for index, row in df_to_process.iterrows():
                     date_val = row[0]
                     bill_val = str(row[1]).strip()
-                    qty_val = float(row[2]) if pd.notna(row[2]) else 0.0
+                    qty_val = pd.to_numeric(str(row[2]).replace(",", "").strip(), errors="coerce") if pd.notna(row[2]) else 0.0
+                    qty_val = 0.0 if pd.isna(qty_val) else float(qty_val)
                     
                     sales_unit = str(row[9]).strip() if len(row) > 9 and pd.notna(row[9]) else ""
                     raw_item_code = str(row[4]).strip() if len(row) > 4 and pd.notna(row[4]) else ""
