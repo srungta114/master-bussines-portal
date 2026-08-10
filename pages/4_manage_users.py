@@ -26,11 +26,16 @@ PAGE_LABELS = {
 }
 
 # Finer-grained than pages: a user can have the page but not a specific
-# risky action within it. Add new entries here whenever a new gated
-# feature is built - key must match what the page's has_permission()/
+# action within it. Add new entries here whenever a new gated feature is
+# built - key must match what the page's has_permission()/
 # require_permission() call checks for.
 PERMISSION_LABELS = {
-    "inventory_bulk_delete": "🗑️ Hardware Inventory: Bulk Delete Bills",
+    "inventory_single_entry": "🛒 Inventory: Single Entry",
+    "inventory_bulk_upload": "📤 Inventory: Bulk Uploads",
+    "inventory_view": "📊 Inventory: View Inventory",
+    "inventory_masters": "📋 Inventory: Masters & AI Memory",
+    "inventory_edit_transactions": "📝 Inventory: Edit a Transaction",
+    "inventory_bulk_delete": "🗑️ Inventory: Bulk Delete Bills",
 }
 
 # --- ADD A NEW USER ---
@@ -143,18 +148,22 @@ else:
                 st.rerun()
 
             # Feature access - finer-grained than pages, same "admins get
-            # everything automatically" rule applies.
+            # everything automatically" rule applies. Wrapped into rows of 3
+            # so this stays readable as more feature keys get added later.
             st.caption("Feature access:")
             current_permissions = set(u.get("permissions", []))
-            perm_cols = st.columns(len(PERMISSION_LABELS))
             updated_permissions = set(current_permissions)
-            for col, (key, label) in zip(perm_cols, PERMISSION_LABELS.items()):
-                with col:
-                    checked = st.checkbox(label, value=key in current_permissions, key=f"perm_{email}_{key}")
-                    if checked:
-                        updated_permissions.add(key)
-                    else:
-                        updated_permissions.discard(key)
+            perm_items = list(PERMISSION_LABELS.items())
+            for row_start in range(0, len(perm_items), 3):
+                row_items = perm_items[row_start:row_start + 3]
+                perm_cols = st.columns(3)
+                for col, (key, label) in zip(perm_cols, row_items):
+                    with col:
+                        checked = st.checkbox(label, value=key in current_permissions, key=f"perm_{email}_{key}")
+                        if checked:
+                            updated_permissions.add(key)
+                        else:
+                            updated_permissions.discard(key)
             if updated_permissions != current_permissions:
                 db.collection("users").document(email).update({"permissions": sorted(updated_permissions)})
                 st.rerun()
