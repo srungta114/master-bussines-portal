@@ -8,7 +8,7 @@ st.set_page_config(page_title="Business Portal", layout="wide", page_icon="🏢"
 
 # --- 2. LOGIN (individual Google accounts, replaces the old shared password) ---
 if not st.user.is_logged_in:
-    st.title("🔒 A S Concern Business Portal")
+    st.title("🔒 Business Portal")
     st.write("Please log in with your Google account to continue.")
     if st.button("Log in with Google", type="primary"):
         st.login("google")
@@ -54,11 +54,17 @@ ALL_PAGE_KEYS = ["inventory", "costing", "debtors"]
 
 # Canonical FEATURE keys - finer-grained than pages. Someone can have access
 # to a whole page (e.g. "inventory") but still be blocked from a specific
-# risky action within it (e.g. "inventory_bulk_delete"), if that key isn't
-# in their granted permissions below. Add new keys here as new gated
-# features are built; each tool page checks its own keys with
-# require_permission().
-ALL_PERMISSION_KEYS = ["inventory_bulk_delete"]
+# action within it, if that key isn't in their granted permissions below.
+# Add new keys here as new gated features are built; each tool page checks
+# its own keys with require_permission()/has_permission().
+ALL_PERMISSION_KEYS = [
+    "inventory_single_entry",       # Hardware Inventory: Single Entry tab
+    "inventory_bulk_upload",        # Hardware Inventory: Bulk Uploads tab
+    "inventory_view",               # Hardware Inventory: View Inventory tab
+    "inventory_masters",            # Hardware Inventory: Masters & AI Memory tab
+    "inventory_edit_transactions",  # Hardware Inventory: Edit Transactions - edit a bill
+    "inventory_bulk_delete",        # Hardware Inventory: Edit Transactions - bulk delete bills
+]
 
 if "user_role" not in st.session_state:
     user_ref = db.collection("users").document(user_email)
