@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 from difflib import get_close_matches
+from google.cloud import firestore
 import re
 import io
 
@@ -107,6 +108,19 @@ def get_learned_mappings():
     except Exception:
         return pd.DataFrame(columns=["Billed_Description", "Matched_Item_Name"])
 
+@st.cache_data(ttl=10)
+def get_stock_levels():
+    """The running-stock aggregate - one small document per item, kept in
+    sync by append_purchases()/overwrite_purchases() via _apply_stock_deltas().
+    This is what View Inventory's Stock Summary reads from, instead of
+    summing every purchase transaction ever recorded on every page load."""
+    try:
+        db = st.session_state.db
+        docs = db.collection("stock_levels").stream()
+        return pd.DataFrame([d.to_dict() for d in docs])
+    except Exception:
+        return pd.DataFrame(columns=["Item_Name", "Net_Qty"])
+
 def _prepare_for_save(df_to_save):
     """Shared date/fiscal-year prep used by both the append and overwrite paths."""
     df_save = df_to_save.copy()
@@ -148,6 +162,71 @@ def _commit_in_batches(db, write_fn, items):
     batch.commit()
 
 
+def _apply_stock_deltas(db, df, sign=1):
+    """Keeps the stock_levels/{item} aggregate collection in sync using
+    atomic Firestore increments - no read-before-write needed, so this is
+    cheap (a handful of writes, zero extra reads) no matter how large the
+    underlying purchases history is. sign=+1 adds the rows' contribution,
+    sign=-1 backs it out (used when overwrite_purchases deletes rows before
+    rewriting them).
+
+    Also stamps each item's Group/Stock Unit onto its aggregate doc (last
+    non-blank value seen wins) purely so View Inventory's Stock Summary can
+    display those columns without needing to touch purchases_fy at all.
+
+    Writes a doc for every item touched by `df`, even ones whose net delta
+    in THIS batch is exactly zero (e.g. a purchase and a full return
+    entered together) - Firestore's Increment() creates the field starting
+    from 0 if it doesn't already exist, so this still correctly produces a
+    Net_Qty: 0 doc rather than silently omitting the item from the
+    aggregate (and therefore from the Stock Summary) just because nothing
+    changed in this particular batch.
+
+    View Inventory's Stock Summary reads THIS collection (one small doc per
+    item) instead of summing every purchase transaction ever recorded.
+    """
+    if df is None or df.empty or 'Item_Name' not in df.columns or 'Stock Qty Added' not in df.columns:
+        return
+
+    work = df.copy()
+    work['_qty'] = pd.to_numeric(work['Stock Qty Added'], errors='coerce').fillna(0)
+
+    def first_non_blank(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() != "":
+                return v
+        return None
+
+    agg_spec = {'_qty': 'sum'}
+    if 'Group' in work.columns:
+        agg_spec['Group'] = first_non_blank
+    if 'Stock Unit' in work.columns:
+        agg_spec['Stock Unit'] = first_non_blank
+
+    grouped = work.groupby('Item_Name').agg(agg_spec)
+    if grouped.empty:
+        return
+
+    coll_ref = db.collection("stock_levels")
+
+    def write_delta(batch, item):
+        item_name, row = item
+        if not item_name or pd.isna(item_name):
+            return
+        doc_data = {
+            "Item_Name": item_name,
+            "Net_Qty": firestore.Increment(sign * float(row['_qty'])),
+        }
+        if 'Group' in row and pd.notna(row.get('Group')):
+            doc_data["Group"] = row['Group']
+        if 'Stock Unit' in row and pd.notna(row.get('Stock Unit')):
+            doc_data["Stock_Unit"] = row['Stock Unit']
+        doc_ref = coll_ref.document(_sanitize_doc_id(item_name))
+        batch.set(doc_ref, doc_data, merge=True)
+
+    _commit_in_batches(db, write_delta, list(grouped.iterrows()))
+
+
 def append_purchases(new_rows_df):
     """Append-only save: adds new rows as new documents in the correct FY's
     entries subcollection WITHOUT reading or rewriting any existing data
@@ -183,6 +262,10 @@ def append_purchases(new_rows_df):
             rows,
         )
 
+    # New rows are purely additive here (nothing was deleted), so just add
+    # their contribution to the running stock aggregate.
+    _apply_stock_deltas(db, df_save, sign=1)
+
 
 def overwrite_purchases(df_to_save, only_fys=None):
     """Full clear-and-rewrite save - ONLY for flows that genuinely need to
@@ -216,8 +299,13 @@ def overwrite_purchases(df_to_save, only_fys=None):
         fy_id = _fy_to_doc_id(fy)
         entries_ref = db.collection("purchases_fy").document(fy_id).collection("entries")
 
-        # Delete every existing document in this FY's subcollection first...
-        existing_refs = [d.reference for d in entries_ref.stream()]
+        # Read what's there BEFORE deleting, so we can back its contribution
+        # out of the stock aggregate below - the docs are already being
+        # fetched for the delete itself, so this doesn't cost any extra
+        # Firestore reads beyond what overwrite_purchases already needed.
+        existing_docs = list(entries_ref.stream())
+        old_rows_df = pd.DataFrame([d.to_dict() for d in existing_docs]) if existing_docs else pd.DataFrame()
+        existing_refs = [d.reference for d in existing_docs]
         _commit_in_batches(db, lambda batch, ref: batch.delete(ref), existing_refs)
 
         # ...then write the fresh set for this FY.
@@ -228,6 +316,12 @@ def overwrite_purchases(df_to_save, only_fys=None):
             lambda batch, row: batch.set(entries_ref.document(), row),
             rows,
         )
+
+        # Back out what was deleted, then add back whatever the fresh set
+        # actually contains - covers edits, deletes, and duplicate-bill
+        # overrides all with the same two calls.
+        _apply_stock_deltas(db, old_rows_df, sign=-1)
+        _apply_stock_deltas(db, group_df, sign=1)
 
 def save_learned_mappings(df_to_save):
     # Learned_Mappings is small (~400 rows), so - like the old sheet-clear
@@ -250,11 +344,26 @@ def save_learned_mappings(df_to_save):
 
 # Initialization
 products_df = get_product_master()
-purchases_df = get_purchases()
 
-# Dynamically apply Fiscal Year to active session data if it's an older database version
-if not purchases_df.empty and 'Date' in purchases_df.columns:
-    purchases_df['Fiscal Year'] = purchases_df['Date'].apply(get_nepali_fiscal_year)
+# NOTE: purchases_df is deliberately NOT loaded here. get_purchases() reads
+# every purchase transaction ever recorded via a Firestore collection_group
+# query (one billed read per document - tens of thousands of them). Loading
+# it unconditionally on every script rerun, regardless of which tab is even
+# being used, is what caused the Firestore daily quota (ResourceExhausted)
+# to blow out. It's now fetched lazily, once, inside each tab body that
+# actually needs it (and only after that tab's permission check passes) via
+# the local load_purchases() helper below - so a user who only has, say,
+# Masters & AI Memory access never triggers it at all.
+
+def load_purchases():
+    """On-demand purchases loader - call this from inside a tab body right
+    before the data is actually needed, not at module level. Cached by
+    get_purchases() itself, so calling this more than once in the same tab
+    or across tabs within the same rerun is free."""
+    df = get_purchases()
+    if not df.empty and 'Date' in df.columns:
+        df['Fiscal Year'] = df['Date'].apply(get_nepali_fiscal_year)
+    return df
 
 mapping_df = get_code_mapping()
 learned_df = get_learned_mappings()
@@ -772,7 +881,8 @@ with tab1:
     if "inventory_single_entry" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Adding new transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-    
+        purchases_df = load_purchases()
+
         trans_type = st.radio(
             "Select Transaction Type", 
             ["Purchase", "Sales", "Purchase Return", "Sales Return", "Opening Stock", "Stock Adjustment"], 
@@ -928,7 +1038,8 @@ with tab2:
     if "inventory_bulk_upload" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Bulk uploading transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-    
+        purchases_df = load_purchases()
+
         bulk_type = st.radio(
             "Select Upload Type", 
             ["Sales", "Purchases", "Purchase Returns", "Sales Returns"], 
@@ -1288,22 +1399,27 @@ with tab3:
     if "inventory_view" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Viewing stock levels and the ledger requires a permission an administrator hasn't granted your account yet.")
     else:
-    
         st.subheader("Stock Summary Report")
         summary_items = st.multiselect("Select Item(s) to view (Leave blank for all)", options=products_df['Item_Name'].dropna().unique())
-    
-        if not purchases_df.empty:
-            inventory_summary = purchases_df.groupby(['Group', 'Item_Name', 'Stock Unit'])['Stock Qty Added'].sum().reset_index()
-            inventory_summary.rename(columns={'Stock Qty Added': 'Total Stock on Hand'}, inplace=True)
-        
+
+        # Reads the small stock_levels aggregate (one doc per item that has
+        # ever moved) instead of summing every purchase transaction ever
+        # recorded - this is the whole point of maintaining that aggregate.
+        stock_df = get_stock_levels()
+
+        if not stock_df.empty:
+            inventory_summary = stock_df.rename(columns={"Net_Qty": "Total Stock on Hand", "Stock_Unit": "Stock Unit"})
+            cols_order = [c for c in ["Group", "Item_Name", "Stock Unit", "Total Stock on Hand"] if c in inventory_summary.columns]
+            inventory_summary = inventory_summary[cols_order]
+
             if summary_items:
                 inventory_summary = inventory_summary[inventory_summary['Item_Name'].isin(summary_items)]
-            
+
             st.dataframe(inventory_summary, use_container_width=True, hide_index=True)
-        
+
             st.divider()
             st.subheader("Item Stock Ledger")
-        
+
             c1, c2 = st.columns(2)
             with c1:
                 ledger_item = smart_item_search(
@@ -1311,23 +1427,37 @@ with tab3:
                     products_df['Item_Name'].dropna().unique().tolist(),
                     key="ledger_item_search",
                 )
-            with c2:
-                fy_options = ["All"] + sorted(purchases_df['Fiscal Year'].dropna().unique().tolist(), reverse=True) if not purchases_df.empty and 'Fiscal Year' in purchases_df.columns else ["All"]
-                selected_fy = st.selectbox("Filter Ledger by Fiscal Year", options=fy_options)
-            
+
             if ledger_item:
-                ledger = purchases_df[purchases_df['Item_Name'] == ledger_item].copy()
-                ledger['Date_Parsed'] = pd.to_datetime(ledger['Date'], dayfirst=True, errors='coerce')
-                ledger = ledger.sort_values('Date_Parsed')
-            
-                # Run the global cumulative sum FIRST for accounting accuracy
-                ledger['Running Balance'] = ledger['Stock Qty Added'].cumsum()
-            
-                # Then filter the view by Fiscal Year if requested
-                if selected_fy != "All":
-                    ledger = ledger[ledger['Fiscal Year'] == selected_fy]
-                
-                st.dataframe(ledger[['Fiscal Year', 'Date', 'Bill Number', 'Purchase Qty', 'Stock Qty Added', 'Running Balance']], use_container_width=True, hide_index=True)
+                # Targeted query for just this item's transactions, instead
+                # of loading the entire purchases history and filtering in
+                # memory - costs roughly one Firestore read per transaction
+                # THIS item has, not one per transaction across every item.
+                db = st.session_state.db
+                item_docs = db.collection_group("entries").where("Item_Name", "==", ledger_item).stream()
+                ledger = pd.DataFrame([d.to_dict() for d in item_docs])
+
+                if ledger.empty:
+                    st.info(f"No transactions found for {ledger_item}.")
+                else:
+                    ledger['Date_Parsed'] = pd.to_datetime(ledger['Date'], dayfirst=True, errors='coerce')
+                    ledger = ledger.sort_values('Date_Parsed')
+
+                    # Run the global cumulative sum FIRST for accounting accuracy
+                    ledger['Running Balance'] = pd.to_numeric(ledger['Stock Qty Added'], errors='coerce').fillna(0).cumsum()
+
+                    with c2:
+                        fy_options = (
+                            ["All"] + sorted(ledger['Fiscal Year'].dropna().unique().tolist(), reverse=True)
+                            if 'Fiscal Year' in ledger.columns else ["All"]
+                        )
+                        selected_fy = st.selectbox("Filter Ledger by Fiscal Year", options=fy_options)
+
+                    # Then filter the view by Fiscal Year if requested
+                    if selected_fy != "All":
+                        ledger = ledger[ledger['Fiscal Year'] == selected_fy]
+
+                    st.dataframe(ledger[['Fiscal Year', 'Date', 'Bill Number', 'Purchase Qty', 'Stock Qty Added', 'Running Balance']], use_container_width=True, hide_index=True)
         else:
             st.write("No inventory data found.")
 
@@ -1363,10 +1493,16 @@ with tab4:
 # --- TAB 5: UNIFIED EDIT TRANSACTIONS ---
 with tab5:
     st.header("Edit Database Transactions")
-    
-    if purchases_df.empty:
+
+    _has_edit_perm = "inventory_edit_transactions" in st.session_state.get("user_permissions", [])
+    _has_delete_perm = "inventory_bulk_delete" in st.session_state.get("user_permissions", [])
+
+    if not _has_edit_perm and not _has_delete_perm:
+        st.info("🔒 Editing or deleting transactions requires a permission an administrator hasn't granted your account yet.")
+    elif load_purchases().empty:
         st.info("No records found in the database.")
     else:
+        purchases_df = load_purchases()
         df_filtered = purchases_df.copy()
         df_filtered['Date_Str'] = pd.to_datetime(df_filtered['Date'], dayfirst=True, errors='coerce').dt.strftime('%d/%m/%Y')
         
@@ -1374,7 +1510,7 @@ with tab5:
         fy_col = df_filtered['Fiscal Year'].astype(str) if 'Fiscal Year' in df_filtered.columns else "FY Unknown"
         df_filtered['Bill_Label'] = fy_col + " | " + df_filtered['Bill Number'].astype(str).str.strip() + " (Date: " + df_filtered['Date_Str'].astype(str) + ")"
         
-        if "inventory_edit_transactions" not in st.session_state.get("user_permissions", []):
+        if not _has_edit_perm:
             st.info("🔒 Editing transactions requires a permission an administrator hasn't granted your account yet.")
         else:
             bill_list = sorted(df_filtered['Bill_Label'].dropna().unique())
