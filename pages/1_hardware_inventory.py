@@ -366,7 +366,7 @@ def load_purchases():
     return df
 
 
-def lazy_load(session_key, loader_fn, label):
+def lazy_load(session_key, loader_fn, label, widget_key=None):
     """Only calls loader_fn() (a live Firestore read) when the person
     explicitly clicks a button - nothing is fetched just because the app
     opened or the script reran for an unrelated reason. This matters
@@ -380,12 +380,25 @@ def lazy_load(session_key, loader_fn, label):
     clear_lazy_cache() so the next view is guaranteed fresh rather than
     silently stale.
 
+    session_key is the DATA cache key - deliberately the same across
+    multiple tabs that share the same underlying data (e.g. Tabs 1, 2, and
+    5 all use "sd_purchases_df"), so loading once in one tab makes it
+    available in the others too without re-fetching.
+
+    widget_key is the BUTTON's key and must be unique per call site, since
+    all tab bodies render every rerun regardless of which tab is visible -
+    two buttons sharing a key (e.g. from two tabs both defaulting to
+    f"lazy_btn_{session_key}") raises StreamlitDuplicateElementKey. Pass a
+    distinct widget_key (e.g. the tab name) whenever the same session_key
+    is used in more than one place.
+
     Returns None if not yet loaded - callers should skip the rest of that
     tab's body in that case (see usage in each tab below).
     """
+    widget_key = widget_key or session_key
     is_loaded = session_key in st.session_state
     btn_label = f"🔄 Refresh {label}" if is_loaded else f"📥 Load {label}"
-    if st.button(btn_label, key=f"lazy_btn_{session_key}"):
+    if st.button(btn_label, key=f"lazy_btn_{widget_key}"):
         with st.spinner(f"Fetching {label}..."):
             st.session_state[session_key] = loader_fn()
         st.rerun()
@@ -918,7 +931,7 @@ with tab1:
     if "inventory_single_entry" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Adding new transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data")
+        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data", widget_key="purchases_tab1")
 
         if purchases_df is None:
             pass  # lazy_load already showed the Load button + caption above
@@ -1079,7 +1092,7 @@ with tab2:
     if "inventory_bulk_upload" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Bulk uploading transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data")
+        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data", widget_key="purchases_tab2")
 
         if purchases_df is None:
             pass  # lazy_load already showed the Load button + caption above
@@ -1548,7 +1561,7 @@ with tab5:
     if not _has_edit_perm and not _has_delete_perm:
         st.info("🔒 Editing or deleting transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data")
+        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data", widget_key="purchases_tab5")
 
         if purchases_df is None:
             pass  # lazy_load already showed the Load button + caption above
