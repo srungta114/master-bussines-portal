@@ -59,6 +59,104 @@ def smart_item_search(label, items, key, placeholder="Type or click to find an i
     return st.selectbox(label, options=options, index=None, key=key, placeholder=placeholder)
 
 
+def render_add_new_sku_form(df_master, key_prefix, select_after_create_key=None):
+    """Drop-in 'create a new SKU on the fly' expander - for whenever the
+    material someone's trying to cost isn't in Product Master yet, so they
+    don't have to abandon the bill and go find an admin tool. Writes
+    straight to product_master (the SAME collection Hardware Inventory
+    reads from/writes to), so the new SKU is usable there immediately too.
+
+    Deliberately NOT wrapped in st.form: the Group/Unit dropdowns need to
+    dynamically reveal a "type a new one" text box the moment "Add New..."
+    is picked, and st.form batches all widget interactions until submit -
+    it wouldn't react to that selection until the whole form was already
+    submitted. Using plain widgets means a few extra script reruns while
+    filling this in, but nothing here touches Firestore until the actual
+    Create SKU click, so that cost is negligible.
+
+    If select_after_create_key is given, the newly created item is
+    pre-selected in the smart_item_search box with that key on the rerun
+    that follows.
+    """
+    existing_groups = sorted(df_master['Group'].dropna().unique().tolist()) if 'Group' in df_master.columns else []
+    existing_p_units = sorted(df_master['Purchase_Unit'].dropna().unique().tolist()) if 'Purchase_Unit' in df_master.columns else []
+    existing_s_units = sorted(df_master['Sales_Unit'].dropna().unique().tolist()) if 'Sales_Unit' in df_master.columns else []
+    existing_names_lower = set(df_master['Item_Name'].dropna().str.strip().str.lower()) if 'Item_Name' in df_master.columns else set()
+
+    ADD_NEW = "➕ Add New..."
+    field_keys = [
+        f"{key_prefix}_new_item_name", f"{key_prefix}_new_group_choice", f"{key_prefix}_new_group_typed",
+        f"{key_prefix}_new_subgroup", f"{key_prefix}_new_p_unit_choice", f"{key_prefix}_new_p_unit_typed",
+        f"{key_prefix}_new_s_unit_choice", f"{key_prefix}_new_s_unit_typed", f"{key_prefix}_new_conv_factor",
+    ]
+
+    with st.expander("➕ Can't find the material? Add a new SKU"):
+        new_item_name = st.text_input("Item Name*", key=f"{key_prefix}_new_item_name")
+
+        gc1, gc2 = st.columns(2)
+        group_choice = gc1.selectbox(
+            "Group*", options=existing_groups + [ADD_NEW],
+            index=None, key=f"{key_prefix}_new_group_choice",
+        )
+        new_group_typed = ""
+        if group_choice == ADD_NEW:
+            new_group_typed = gc2.text_input("New Group Name", key=f"{key_prefix}_new_group_typed")
+
+        new_sub_group = st.text_input("Sub-Group (optional)", key=f"{key_prefix}_new_subgroup")
+
+        uc1, uc2 = st.columns(2)
+        with uc1:
+            p_unit_choice = st.selectbox(
+                "Purchase Unit*", options=existing_p_units + [ADD_NEW],
+                index=None, key=f"{key_prefix}_new_p_unit_choice",
+            )
+            new_p_unit_typed = ""
+            if p_unit_choice == ADD_NEW:
+                new_p_unit_typed = st.text_input("New Purchase Unit", key=f"{key_prefix}_new_p_unit_typed")
+        with uc2:
+            s_unit_choice = st.selectbox(
+                "Sales Unit*", options=existing_s_units + [ADD_NEW],
+                index=None, key=f"{key_prefix}_new_s_unit_choice",
+            )
+            new_s_unit_typed = ""
+            if s_unit_choice == ADD_NEW:
+                new_s_unit_typed = st.text_input("New Sales Unit", key=f"{key_prefix}_new_s_unit_typed")
+
+        new_conv_factor = st.number_input(
+            "Conversion Factor (Purchase Unit → Sales Unit)",
+            min_value=0.0001, value=1.0, step=0.1, key=f"{key_prefix}_new_conv_factor",
+            help="How many Sales Units make up one Purchase Unit. Leave at 1.0 if Purchase and Sales units are the same.",
+        )
+
+        if st.button("✅ Create SKU", key=f"{key_prefix}_create_sku_btn", type="primary"):
+            group_val = new_group_typed if group_choice == ADD_NEW else group_choice
+            p_unit_val = new_p_unit_typed if p_unit_choice == ADD_NEW else p_unit_choice
+            s_unit_val = new_s_unit_typed if s_unit_choice == ADD_NEW else s_unit_choice
+
+            if not new_item_name.strip():
+                st.error("Item Name is required.")
+            elif new_item_name.strip().lower() in existing_names_lower:
+                st.error(f"'{new_item_name.strip()}' already exists in Product Master - search for it above instead.")
+            elif not group_val or not str(group_val).strip():
+                st.error("Group is required.")
+            elif not p_unit_val or not str(p_unit_val).strip():
+                st.error("Purchase Unit is required.")
+            elif not s_unit_val or not str(s_unit_val).strip():
+                st.error("Sales Unit is required.")
+            else:
+                status = save_new_product(new_item_name, group_val, new_sub_group or "", p_unit_val, s_unit_val, new_conv_factor)
+                if status == "duplicate":
+                    st.error(f"'{new_item_name.strip()}' already exists in Product Master - search for it above instead.")
+                else:
+                    st.cache_data.clear()
+                    for k in field_keys:
+                        st.session_state.pop(k, None)
+                    if select_after_create_key:
+                        st.session_state[select_after_create_key] = new_item_name.strip()
+                    st.success(f"✅ Created new SKU: {new_item_name.strip()}")
+                    st.rerun()
+
+
 # --- 2. SECURE DATA LOADERS (FIRESTORE) ---
 import re as _re
 
@@ -82,6 +180,30 @@ def load_products():
     except Exception as e:
         st.error(f"Failed to load Product Master: {e}")
         return pd.DataFrame()
+
+
+def save_new_product(item_name, group, sub_group, purchase_unit, sales_unit, conversion_factor):
+    """Creates a new SKU in product_master - the SAME collection Hardware
+    Inventory reads from/writes to, so a SKU added here is immediately
+    usable there too (and vice versa). Doc ID is the sanitized item name,
+    matching the convention used everywhere else this collection is
+    written. Returns "ok" or "duplicate" (an item with this name already
+    exists - overwriting it here would silently wipe out whatever
+    Group/Units/Conversion Factor it already had)."""
+    db = st.session_state.db
+    doc_id = sanitize_doc_id(item_name)
+    doc_ref = db.collection("product_master").document(doc_id)
+    if doc_ref.get().exists:
+        return "duplicate"
+    doc_ref.set({
+        "Item_Name": item_name.strip(),
+        "Group": group.strip(),
+        "Sub-Group": sub_group.strip(),
+        "Purchase_Unit": purchase_unit.strip(),
+        "Sales_Unit": sales_unit.strip(),
+        "Conversion_Factor": conversion_factor,
+    })
+    return "ok"
 
 
 @st.cache_data(ttl=3600)
@@ -685,6 +807,8 @@ with st.container(border=True):
         key="costing_select_product",
         placeholder="Type or click to find a product...",
     )
+
+    render_add_new_sku_form(df_master, key_prefix="costing", select_after_create_key="costing_select_product")
 
     if selected_product:
         if selected_product in existing_items_in_bill:
