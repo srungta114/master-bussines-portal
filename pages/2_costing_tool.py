@@ -72,7 +72,7 @@ def sanitize_doc_id(name):
     return doc_id if doc_id else "unnamed"
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=3600)
 def load_products():
     try:
         db = st.session_state.db
@@ -84,7 +84,7 @@ def load_products():
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=3600)
 def load_materials_costing():
     """One row per material, each with its own 'recent_costings' list (up to
     5 most recent entries, newest first) embedded in the Recent_Costings column."""
