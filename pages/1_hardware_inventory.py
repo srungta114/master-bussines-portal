@@ -76,6 +76,29 @@ def get_product_master():
     except Exception:
         return pd.DataFrame(columns=["Item_Name", "Purchase_Unit", "Sales_Unit", "Group"])
 
+
+def save_new_product(item_name, group, sub_group, purchase_unit, sales_unit):
+    """Creates a new SKU in product_master - the SAME collection the
+    Costing Tool reads from, so a SKU added here is immediately usable
+    there too. Doc ID is the sanitized item name, matching the convention
+    used everywhere else this collection is written (migration script,
+    Costing Tool). Returns "ok" or "duplicate" (an item with this name
+    already exists - overwriting it here would silently wipe out whatever
+    Group/Units it already had)."""
+    db = st.session_state.db
+    doc_id = _sanitize_doc_id(item_name)
+    doc_ref = db.collection("product_master").document(doc_id)
+    if doc_ref.get().exists:
+        return "duplicate"
+    doc_ref.set({
+        "Item_Name": item_name.strip(),
+        "Group": group.strip(),
+        "Sub-Group": sub_group.strip(),
+        "Purchase_Unit": purchase_unit.strip(),
+        "Sales_Unit": sales_unit.strip(),
+    })
+    return "ok"
+
 @st.cache_data(ttl=3600)
 def get_purchases():
     # Every fiscal year's transactions live in their own subcollection at
@@ -988,6 +1011,99 @@ def smart_item_search(label, items, key, placeholder="Click here to type..."):
     return st.selectbox(label, options=options, index=None, key=key, placeholder=placeholder)
 
 
+def render_add_new_sku_form(products_df, key_prefix, select_after_create_key=None):
+    """Drop-in 'create a new SKU on the fly' expander - for whenever the
+    item someone's trying to enter data for isn't in Product Master yet, so
+    they don't have to abandon what they're doing and go find an admin
+    tool. Writes straight to product_master (same collection the Costing
+    Tool reads from), so the new SKU is usable there immediately too.
+
+    Deliberately NOT wrapped in st.form: the Group/Unit dropdowns need to
+    dynamically reveal a "type a new one" text box the moment "Add New..."
+    is picked, and st.form batches all widget interactions until submit -
+    it wouldn't react to that selection until the whole form was already
+    submitted. Using plain widgets means a few extra script reruns while
+    filling this in, but nothing here touches Firestore until the actual
+    Create SKU click, so that cost is negligible.
+
+    If select_after_create_key is given, the newly created item is
+    pre-selected in the smart_item_search box with that key on the rerun
+    that follows (so the person lands right back on the item they just
+    created, instead of having to search for it again).
+    """
+    existing_groups = sorted(products_df['Group'].dropna().unique().tolist()) if 'Group' in products_df.columns else []
+    existing_p_units = sorted(products_df['Purchase_Unit'].dropna().unique().tolist()) if 'Purchase_Unit' in products_df.columns else []
+    existing_s_units = sorted(products_df['Sales_Unit'].dropna().unique().tolist()) if 'Sales_Unit' in products_df.columns else []
+    existing_names_lower = set(products_df['Item_Name'].dropna().str.strip().str.lower()) if 'Item_Name' in products_df.columns else set()
+
+    ADD_NEW = "➕ Add New..."
+    field_keys = [
+        f"{key_prefix}_new_item_name", f"{key_prefix}_new_group_choice", f"{key_prefix}_new_group_typed",
+        f"{key_prefix}_new_subgroup", f"{key_prefix}_new_p_unit_choice", f"{key_prefix}_new_p_unit_typed",
+        f"{key_prefix}_new_s_unit_choice", f"{key_prefix}_new_s_unit_typed",
+    ]
+
+    with st.expander("➕ Can't find the item? Add a new SKU"):
+        new_item_name = st.text_input("Item Name*", key=f"{key_prefix}_new_item_name")
+
+        gc1, gc2 = st.columns(2)
+        group_choice = gc1.selectbox(
+            "Group*", options=existing_groups + [ADD_NEW],
+            index=None, key=f"{key_prefix}_new_group_choice",
+        )
+        new_group_typed = ""
+        if group_choice == ADD_NEW:
+            new_group_typed = gc2.text_input("New Group Name", key=f"{key_prefix}_new_group_typed")
+
+        new_sub_group = st.text_input("Sub-Group (optional)", key=f"{key_prefix}_new_subgroup")
+
+        uc1, uc2 = st.columns(2)
+        with uc1:
+            p_unit_choice = st.selectbox(
+                "Purchase Unit*", options=existing_p_units + [ADD_NEW],
+                index=None, key=f"{key_prefix}_new_p_unit_choice",
+            )
+            new_p_unit_typed = ""
+            if p_unit_choice == ADD_NEW:
+                new_p_unit_typed = st.text_input("New Purchase Unit", key=f"{key_prefix}_new_p_unit_typed")
+        with uc2:
+            s_unit_choice = st.selectbox(
+                "Sales Unit*", options=existing_s_units + [ADD_NEW],
+                index=None, key=f"{key_prefix}_new_s_unit_choice",
+            )
+            new_s_unit_typed = ""
+            if s_unit_choice == ADD_NEW:
+                new_s_unit_typed = st.text_input("New Sales Unit", key=f"{key_prefix}_new_s_unit_typed")
+
+        if st.button("✅ Create SKU", key=f"{key_prefix}_create_sku_btn", type="primary"):
+            group_val = new_group_typed if group_choice == ADD_NEW else group_choice
+            p_unit_val = new_p_unit_typed if p_unit_choice == ADD_NEW else p_unit_choice
+            s_unit_val = new_s_unit_typed if s_unit_choice == ADD_NEW else s_unit_choice
+
+            if not new_item_name.strip():
+                st.error("Item Name is required.")
+            elif new_item_name.strip().lower() in existing_names_lower:
+                st.error(f"'{new_item_name.strip()}' already exists in Product Master - search for it above instead.")
+            elif not group_val or not str(group_val).strip():
+                st.error("Group is required.")
+            elif not p_unit_val or not str(p_unit_val).strip():
+                st.error("Purchase Unit is required.")
+            elif not s_unit_val or not str(s_unit_val).strip():
+                st.error("Sales Unit is required.")
+            else:
+                status = save_new_product(new_item_name, group_val, new_sub_group or "", p_unit_val, s_unit_val)
+                if status == "duplicate":
+                    st.error(f"'{new_item_name.strip()}' already exists in Product Master - search for it above instead.")
+                else:
+                    st.cache_data.clear()
+                    for k in field_keys:
+                        st.session_state.pop(k, None)
+                    if select_after_create_key:
+                        st.session_state[select_after_create_key] = new_item_name.strip()
+                    st.success(f"✅ Created new SKU: {new_item_name.strip()}")
+                    st.rerun()
+
+
 st.title("📦 Hardware Inventory Management")
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🛒 Single Entry", "📤 Bulk Uploads", "📊 View Inventory", "📋 Masters & AI Memory", "📝 Edit Transactions"
@@ -1044,6 +1160,8 @@ with tab1:
 
             items = products_df['Item_Name'].dropna().unique().tolist()
             selected_item = smart_item_search("Search and Select Item to Add", items, key="tab1_item_search")
+
+            render_add_new_sku_form(products_df, key_prefix="tab1", select_after_create_key="tab1_item_search")
 
             if selected_item:
                 item_details = products_df[products_df['Item_Name'] == selected_item].iloc[0]
@@ -1433,6 +1551,17 @@ with tab2:
 
                         if unmatched:
                             st.warning(f"⚠️ {len(unmatched)} items could not be matched automatically.")
+
+                            # Placed OUTSIDE the manual-matching form below (not inside
+                            # it) for the same reactivity reason as Tab 1's version -
+                            # forms batch every widget until submit, so the Group/Unit
+                            # "Add New..." toggle wouldn't react live inside one. Works
+                            # the same way regardless of bulk_type (Sales, Purchases,
+                            # Purchase Returns, Sales Returns all share this one flow) -
+                            # any SKU created here immediately appears as a selectable
+                            # option in the "Match to Master Product" dropdowns below.
+                            render_add_new_sku_form(products_df, key_prefix="tab2", select_after_create_key=None)
+
                             with st.form("manual_mapping_form"):
                                 manual_selections = []
                                 h1, h2, h3, h4, h5, h6 = st.columns([1, 1.5, 0.5, 1, 2.5, 2])
