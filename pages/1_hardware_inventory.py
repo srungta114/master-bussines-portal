@@ -65,7 +65,7 @@ def _sanitize_doc_id(name):
     return doc_id if doc_id else "unnamed"
 
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=3600)
 def get_product_master():
     # Shared with the Costing Tool - already migrated to Firestore there,
     # so this just reads the same collection rather than re-migrating it.
@@ -76,21 +76,32 @@ def get_product_master():
     except Exception:
         return pd.DataFrame(columns=["Item_Name", "Purchase_Unit", "Sales_Unit", "Group"])
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=3600)
 def get_purchases():
     # Every fiscal year's transactions live in their own subcollection at
     # purchases_fy/{fy}/entries. A collection_group query reads across every
     # one of those subcollections in a single call, replacing the old
     # "loop every FY worksheet" pattern.
+    #
+    # _doc_id/_fy_doc_id are captured (and NOT written back to Firestore -
+    # they're stripped before any save) so that editing or deleting a
+    # transaction later can target that exact document directly, instead of
+    # having to clear and rewrite everything in that fiscal year just to
+    # touch one row.
     try:
         db = st.session_state.db
         docs = db.collection_group("entries").stream()
-        records = [d.to_dict() for d in docs]
+        records = []
+        for d in docs:
+            row = d.to_dict()
+            row['_doc_id'] = d.id
+            row['_fy_doc_id'] = d.reference.parent.parent.id
+            records.append(row)
         return pd.DataFrame(records) if records else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=3600)
 def get_code_mapping():
     try:
         db = st.session_state.db
@@ -99,7 +110,7 @@ def get_code_mapping():
     except Exception:
         return pd.DataFrame(columns=["Item Code", "Item Name", "Units"])
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=3600)
 def get_learned_mappings():
     try:
         db = st.session_state.db
@@ -108,7 +119,7 @@ def get_learned_mappings():
     except Exception:
         return pd.DataFrame(columns=["Billed_Description", "Matched_Item_Name"])
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=3600)
 def get_stock_levels():
     """The running-stock aggregate - one small document per item, kept in
     sync by append_purchases()/overwrite_purchases() via _apply_stock_deltas().
@@ -268,17 +279,21 @@ def append_purchases(new_rows_df):
 
 
 def overwrite_purchases(df_to_save, only_fys=None):
-    """Full clear-and-rewrite save - ONLY for flows that genuinely need to
-    remove or replace existing rows (editing a transaction, or choosing
-    'Override' on a duplicate bill during bulk upload).
+    """Full clear-and-rewrite of one or more fiscal years' worth of
+    transactions.
 
-    Mirrors the old sheet-tab clear-and-rewrite, but scoped to Firestore:
-    pass `only_fys` (a fiscal-year string or list of them) to restrict the
-    rewrite to just the FY subcollection(s) that actually changed, so a
-    single edited bill doesn't trigger a full rewrite of every other
-    year's untouched history. If `only_fys` is None, every fiscal year
-    present in df_to_save is rewritten (used for full-dataset migrations
-    only).
+    NOT USED BY ANY UI PATH ANYMORE - editing a transaction, deleting bills,
+    and overriding a duplicate bill during bulk upload all now use the
+    targeted update_purchase_entry()/delete_purchase_entries() functions
+    below instead, which touch only the specific document(s) actually
+    changing rather than reading, deleting, and rewriting every transaction
+    in the affected fiscal year(s). On a database with thousands of
+    transactions per year, that used to mean thousands of reads/deletes/
+    writes for a single-bill edit or a handful of deletions.
+
+    Left here, unused, as a documented fallback in case a genuine
+    full-fiscal-year rebuild is ever needed (e.g. a one-off data-repair
+    script) - it is not wired into any button in this file.
     """
     if df_to_save.empty and not only_fys:
         return
@@ -322,6 +337,59 @@ def overwrite_purchases(df_to_save, only_fys=None):
         # overrides all with the same two calls.
         _apply_stock_deltas(db, old_rows_df, sign=-1)
         _apply_stock_deltas(db, group_df, sign=1)
+
+
+def update_purchase_entry(fy_doc_id, doc_id, updated_fields):
+    """Targeted single-document update - touches exactly ONE transaction
+    document by its real Firestore ID, not the rest of that fiscal year's
+    history. This is what the single-bill editor uses now, in place of
+    overwrite_purchases()'s clear-and-rewrite-the-whole-FY approach - for a
+    fiscal year with thousands of transactions, editing one bill used to
+    cost thousands of reads/deletes/writes for a one-row change; this costs
+    exactly one read (to compute the stock delta) and one write.
+
+    Returns "ok" or "missing" (doc no longer exists - e.g. deleted by
+    someone else since the page was loaded)."""
+    db = st.session_state.db
+    doc_ref = db.collection("purchases_fy").document(fy_doc_id).collection("entries").document(doc_id)
+    snap = doc_ref.get()
+    if not snap.exists:
+        return "missing"
+
+    old_row = snap.to_dict()
+    doc_ref.update(updated_fields)
+
+    # Adjust the stock aggregate by just the delta this one edit causes,
+    # rather than backing out and re-adding an entire fiscal year.
+    _apply_stock_deltas(db, pd.DataFrame([old_row]), sign=-1)
+    _apply_stock_deltas(db, pd.DataFrame([{**old_row, **updated_fields}]), sign=1)
+    return "ok"
+
+
+def delete_purchase_entries(entries):
+    """Targeted deletes - entries is a list of dicts, each with at least
+    fy_doc_id, doc_id, Item_Name, and Stock Qty Added (i.e. rows pulled
+    straight from get_purchases(), which already carries _doc_id/_fy_doc_id
+    for exactly this purpose). Only the specific documents being deleted
+    are touched - the rest of that fiscal year's history is left alone,
+    unlike the old approach of clearing and rewriting the entire FY just to
+    remove a handful of bills."""
+    db = st.session_state.db
+    if not entries:
+        return
+
+    def do_delete(batch, entry):
+        doc_ref = (
+            db.collection("purchases_fy").document(entry['fy_doc_id'])
+            .collection("entries").document(entry['doc_id'])
+        )
+        batch.delete(doc_ref)
+
+    _commit_in_batches(db, do_delete, entries)
+
+    # Back out exactly what was deleted from the stock aggregate.
+    _apply_stock_deltas(db, pd.DataFrame(entries), sign=-1)
+
 
 def save_learned_mappings(df_to_save):
     # Learned_Mappings is small (~400 rows), so - like the old sheet-clear
@@ -1294,20 +1362,16 @@ with tab2:
                             bills_to_delete = st.session_state.get("bills_to_delete", [])
 
                             if bills_to_delete and not purchases_df.empty and 'Bill Number' in purchases_df.columns:
-                                # "Override" means replacing an existing bill's rows. This
-                                # requires an actual rewrite (append can't remove rows) -
-                                # but we scope it to ONLY the fiscal-year tab(s) those
-                                # specific bills live in, so a single overridden bill
-                                # doesn't trigger a full rewrite of every other year's
-                                # untouched transaction history.
+                                # "Override" means replacing an existing bill's rows with the
+                                # fresh ones about to be appended below. This now deletes only
+                                # the specific documents for those bill numbers - using the
+                                # real Firestore doc IDs already carried on purchases_df -
+                                # instead of rewriting every other transaction in that fiscal
+                                # year just to remove a few rows.
                                 affected_mask = purchases_df['Bill Number'].astype(str).str.strip().isin(bills_to_delete)
-                                affected_fys = purchases_df.loc[affected_mask, 'Fiscal Year'].dropna().unique().tolist() if 'Fiscal Year' in purchases_df.columns else []
-
-                                for fy in affected_fys:
-                                    fy_subset = purchases_df[
-                                        (purchases_df['Fiscal Year'] == fy) & (~affected_mask)
-                                    ]
-                                    overwrite_purchases(fy_subset if not fy_subset.empty else pd.DataFrame(columns=purchases_df.columns), only_fys=fy)
+                                rows_to_delete = purchases_df[affected_mask]
+                                if '_doc_id' in rows_to_delete.columns and '_fy_doc_id' in rows_to_delete.columns:
+                                    delete_purchase_entries(rows_to_delete.to_dict('records'))
 
                             if not new_records_df.empty:
                                 append_purchases(new_records_df)
@@ -1585,31 +1649,66 @@ with tab5:
                     bill_data = df_filtered[df_filtered['Bill_Label'] == selected_label].copy()
                     original_indices = bill_data.index
             
-                    # Drop purely visual/temporary columns before passing to the editor
-                    cols_to_drop = ['Bill_Label', 'Date_Str']
+                    # Drop purely visual/temporary columns AND the internal
+                    # _doc_id/_fy_doc_id plumbing fields before showing this to
+                    # the person - they're what makes the targeted save below
+                    # possible, but aren't meant to be seen or edited directly.
+                    cols_to_drop = ['Bill_Label', 'Date_Str', '_doc_id', '_fy_doc_id']
                     if 'Date_Parsed' in bill_data.columns: cols_to_drop.append('Date_Parsed')
-                    display_df = bill_data.drop(columns=cols_to_drop)
+                    display_df = bill_data.drop(columns=[c for c in cols_to_drop if c in bill_data.columns])
             
                     st.write("✏️ **Edit quantities or details below:**")
                     edited_df = st.data_editor(display_df, use_container_width=True)
 
                     if st.button("💾 Save Transaction Changes", type="primary"):
-                        # Scope the rewrite to only the fiscal year(s) this bill touches
-                        # - both where it lived before the edit AND where it lives after
-                        # (in case a date edit moved it into a different fiscal year) -
-                        # instead of rewriting the entire multi-year transaction history
-                        # (which, on a database this size, would mean re-uploading tens
-                        # of thousands of untouched rows for a single-bill edit).
-                        original_fys = bill_data['Fiscal Year'].dropna().unique().tolist() if 'Fiscal Year' in bill_data.columns else []
-                        new_fys = edited_df['Date'].apply(get_nepali_fiscal_year).dropna().unique().tolist() if 'Date' in edited_df.columns else []
-                        affected_fys = sorted(set(original_fys) | set(new_fys))
+                        # Targeted per-document updates - each row is written back
+                        # to its own real Firestore document by _doc_id, not a
+                        # full-FY clear-and-rewrite. On a database with thousands
+                        # of transactions per fiscal year, that used to mean
+                        # rewriting everything just to change one bill; this now
+                        # costs one read + one write per line actually edited.
+                        results = {"ok": 0, "moved": 0, "missing": 0}
 
-                        final_df = purchases_df.drop(index=original_indices).copy()
-                        final_df = pd.concat([final_df, edited_df], ignore_index=True)
-                        overwrite_purchases(final_df, only_fys=affected_fys if affected_fys else None)
+                        for idx in original_indices:
+                            original_row = bill_data.loc[idx]
+                            edited_row = edited_df.loc[idx]
+
+                            fy_doc_id = original_row.get('_fy_doc_id')
+                            doc_id = original_row.get('_doc_id')
+                            if not fy_doc_id or not doc_id:
+                                results["missing"] += 1
+                                continue
+
+                            new_fy = get_nepali_fiscal_year(edited_row.get('Date')) if 'Date' in edited_df.columns else original_row.get('Fiscal Year')
+                            new_fy_doc_id = _fy_to_doc_id(new_fy)
+
+                            updated_fields = {k: edited_row[k] for k in edited_row.index}
+                            updated_fields['Fiscal Year'] = new_fy
+
+                            if new_fy_doc_id == fy_doc_id:
+                                # Same fiscal year - a plain targeted field update.
+                                status = update_purchase_entry(fy_doc_id, doc_id, updated_fields)
+                                results[status] = results.get(status, 0) + 1
+                            else:
+                                # A date edit moved this transaction into a
+                                # different fiscal year. Firestore can't "move" a
+                                # document between subcollections, so this deletes
+                                # the old one and appends a fresh one in the new
+                                # FY's subcollection - still just one document
+                                # touched on each side, not a full-FY rewrite.
+                                delete_purchase_entries([dict(original_row)])
+                                append_purchases(pd.DataFrame([updated_fields]))
+                                results["moved"] += 1
+
                         st.cache_data.clear()
                         clear_lazy_cache()
-                        st.success("✅ Transaction updated successfully!")
+                        if results.get("missing"):
+                            st.warning(
+                                f"Saved {results['ok'] + results['moved']} line(s), but {results['missing']} "
+                                "couldn't be matched to a real record and were skipped."
+                            )
+                        else:
+                            st.success(f"✅ Transaction updated successfully! ({results['ok']} updated, {results['moved']} moved fiscal year)")
                         st.rerun()
 
             st.divider()
@@ -1683,10 +1782,12 @@ with tab5:
                         if st.button("🗑️ Delete Selected Bills", type="primary", disabled=not confirm):
                             labels_to_delete = set(selected_bills['Bill_Label'])
                             rows_to_delete = df_filtered[df_filtered['Bill_Label'].isin(labels_to_delete)]
-                            affected_fys = rows_to_delete['Fiscal Year'].dropna().unique().tolist() if 'Fiscal Year' in rows_to_delete.columns else []
 
-                            final_df = purchases_df.drop(index=rows_to_delete.index).copy()
-                            overwrite_purchases(final_df, only_fys=affected_fys if affected_fys else None)
+                            # Targeted deletes by real Firestore doc ID - only the
+                            # documents for these specific bills are touched, not
+                            # a clear-and-rewrite of every other transaction in
+                            # the fiscal year(s) they happen to live in.
+                            delete_purchase_entries(rows_to_delete.to_dict('records'))
 
                             st.cache_data.clear()
                             clear_lazy_cache()
