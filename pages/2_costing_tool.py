@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from datetime import datetime, timezone
 
 # --- 1. SECURITY BOUNCER ---
 # If the memory was wiped (refresh) or they bypassed the login, stop the page from crashing.
@@ -145,8 +146,205 @@ def get_flat_costing_history(df_materials_costing):
             })
     return pd.DataFrame(rows)
 
+
+def find_bill_entries(df_materials_costing, seller, bill_no, date=None):
+    """Searches every material's (capped, last-5) recent_costings history
+    for entries matching a given Seller + Bill No (+ optionally Date, to
+    disambiguate a supplier reusing the same bill number across different
+    years), keeping track of exactly where each match sits (material + its
+    position in that material's array) so it can be edited or deleted in
+    place afterward.
+
+    Runs entirely in memory over the already-loaded/cached
+    df_materials_costing - no Firestore reads here. Because each material
+    only keeps its 5 most recent costings, a bill that's since been
+    superseded by 5+ newer purchases for the same material will no longer
+    appear here - that's a real limitation of the capped-history model, not
+    a bug, and the caller should say so if no matches turn up."""
+    clean_seller = str(seller).strip().lower()
+    clean_bill = str(bill_no).strip().lower()
+    clean_date = str(date).strip() if date else None
+    matches = []
+    if df_materials_costing.empty:
+        return matches
+
+    for _, mat_row in df_materials_costing.iterrows():
+        material = mat_row.get('Material')
+        history = mat_row.get('recent_costings') or []
+        for idx, entry in enumerate(history):
+            if (str(entry.get('Seller', '')).strip().lower() != clean_seller
+                    or str(entry.get('Bill_No', '')).strip().lower() != clean_bill):
+                continue
+            if clean_date and str(entry.get('Date', '')).strip() != clean_date:
+                continue
+            matches.append({
+                'material': material,
+                'entry_index': idx,
+                'is_latest': idx == 0,
+                **entry,
+            })
+    return matches
+
+
+def _entry_still_matches(stored_entry, expected):
+    """Sanity check before writing: confirms the entry sitting at
+    entry_index right now is still the same one we found earlier, in case
+    someone else edited that material's history in the meantime (the
+    cached df_materials_costing can be up to 60 seconds stale). Compares
+    Bill_No, Seller, and Date - if any differ, the index has shifted and
+    it's not safe to blindly overwrite/delete."""
+    for field in ("Bill_No", "Seller", "Date"):
+        if str(stored_entry.get(field, "")).strip().lower() != str(expected.get(field, "")).strip().lower():
+            return False
+    return True
+
+
+def update_costing_entry(material, entry_index, expected_entry, updated_fields):
+    """Overwrites one entry inside a material's recent_costings array in
+    place (same position, doesn't re-sort). If that entry happens to be the
+    material's latest (index 0), also refreshes the denormalized top-level
+    fields on the doc so Quick Costing Search's headline numbers stay in
+    sync with the edit.
+
+    Returns "ok", "stale", or "missing" - callers should tell the person to
+    refresh and retry on anything other than "ok" rather than assuming it
+    worked."""
+    db = st.session_state.db
+    doc_ref = db.collection("materials_costing").document(sanitize_doc_id(material))
+    snap = doc_ref.get()
+    if not snap.exists:
+        return "missing"
+
+    data = snap.to_dict()
+    history = data.get("recent_costings", [])
+    if entry_index >= len(history) or not _entry_still_matches(history[entry_index], expected_entry):
+        return "stale"
+
+    history[entry_index] = {**history[entry_index], **updated_fields}
+    update_payload = {"recent_costings": history}
+    if entry_index == 0:
+        update_payload.update(updated_fields)
+    doc_ref.update(update_payload)
+    return "ok"
+
+
+def delete_costing_entry(material, entry_index, expected_entry):
+    """Removes one entry from a material's recent_costings array. If the
+    removed entry was the latest (index 0) and older history still exists,
+    the next-most-recent entry gets promoted into the denormalized
+    top-level fields so Quick Costing Search doesn't keep showing a deleted
+    entry's numbers. If no history is left at all, the stale top-level
+    fields are left as-is (nothing better to fall back to).
+
+    Returns "ok", "stale", or "missing", same convention as
+    update_costing_entry()."""
+    db = st.session_state.db
+    doc_ref = db.collection("materials_costing").document(sanitize_doc_id(material))
+    snap = doc_ref.get()
+    if not snap.exists:
+        return "missing"
+
+    data = snap.to_dict()
+    history = data.get("recent_costings", [])
+    if entry_index >= len(history) or not _entry_still_matches(history[entry_index], expected_entry):
+        return "stale"
+
+    was_latest = entry_index == 0
+    del history[entry_index]
+    update_payload = {"recent_costings": history}
+    if was_latest and history:
+        update_payload.update(history[0])
+    doc_ref.update(update_payload)
+    return "ok"
+
+
+def get_last_entered_bill(df_materials_costing):
+    """Finds the most recently SAVED bill (by Entered_At save timestamp,
+    NOT the purchase Date typed on the bill - those can be backdated) across
+    every material's history, and returns every line item that was part of
+    that same save.
+
+    Only entries saved after this feature shipped carry an Entered_At
+    timestamp, so bills entered before that won't show up here - that's
+    expected, not missing data."""
+    if df_materials_costing.empty or 'recent_costings' not in df_materials_costing.columns:
+        return None, pd.DataFrame()
+
+    best_entered_at = None
+    best_key = None
+    for _, mat_row in df_materials_costing.iterrows():
+        for entry in (mat_row.get('recent_costings') or []):
+            ts = entry.get('Entered_At')
+            if not ts:
+                continue
+            if best_entered_at is None or ts > best_entered_at:
+                best_entered_at = ts
+                best_key = (
+                    str(entry.get('Seller', '')).strip().lower(),
+                    str(entry.get('Bill_No', '')).strip().lower(),
+                )
+
+    if best_entered_at is None:
+        return None, pd.DataFrame()
+
+    rows = []
+    for _, mat_row in df_materials_costing.iterrows():
+        material = mat_row.get('Material')
+        for entry in (mat_row.get('recent_costings') or []):
+            key = (
+                str(entry.get('Seller', '')).strip().lower(),
+                str(entry.get('Bill_No', '')).strip().lower(),
+            )
+            if key == best_key and entry.get('Entered_At') == best_entered_at:
+                rows.append({**entry, 'Material': material})
+
+    return best_entered_at, pd.DataFrame(rows)
+
+def lazy_load(session_key, loader_fn, label):
+    """Only calls loader_fn() (a live Firestore read) when the person
+    explicitly clicks a button - nothing is fetched just because the tool
+    was opened. Once loaded, the result lives in st.session_state (not just
+    st.cache_data, whose short TTL can still refire on its own on a later
+    rerun) until the person clicks Refresh, or a write action clears it via
+    clear_lazy_cache() so the next view is guaranteed fresh.
+
+    Returns None if not yet loaded - virtually every section below already
+    treats an empty/missing df_materials_costing gracefully (it was written
+    defensively for brand-new deployments), so callers can just fall back
+    to an empty DataFrame rather than needing special-case branches."""
+    is_loaded = session_key in st.session_state
+    btn_label = f"🔄 Refresh {label}" if is_loaded else f"📥 Load {label}"
+    if st.button(btn_label, key=f"lazy_btn_{session_key}"):
+        with st.spinner(f"Fetching {label}..."):
+            st.session_state[session_key] = loader_fn()
+        st.rerun()
+    if not is_loaded:
+        st.caption(f"Not fetched yet - click \"Load {label}\" above to search or edit existing costing history.")
+        return None
+    return st.session_state[session_key]
+
+
+def clear_lazy_cache():
+    """Call this alongside st.cache_data.clear() after any write, so the
+    next view is forced to fetch fresh data instead of continuing to show
+    whatever was loaded before the edit."""
+    st.session_state.pop("sd_materials_costing", None)
+
+
 df_master = load_products()
-df_materials_costing = load_materials_costing()
+
+st.title("🏗️ Material & Inventory Ledger")
+
+st.subheader("📦 Costing Details")
+st.caption(
+    "The full costing history (every material's recent purchase records) isn't "
+    "fetched automatically when you open this tool - only Product Master (the "
+    "item catalog, needed for search boxes below) loads right away. Click below "
+    "to fetch costing history when you actually need to search, review, or edit it."
+)
+df_materials_costing = lazy_load("sd_materials_costing", load_materials_costing, "Costing Details")
+if df_materials_costing is None:
+    df_materials_costing = pd.DataFrame()
 df_purchases = get_flat_costing_history(df_materials_costing)
 
 
@@ -159,8 +357,6 @@ else:
 # Initialize Session State
 if 'bill_items' not in st.session_state:
     st.session_state.bill_items = []
-
-st.title("🏗️ Material & Inventory Ledger")
 
 
 # --- 3. QUICK COSTING SEARCH ---
@@ -255,20 +451,170 @@ with st.expander("Search Master Database", expanded=False):
 
 st.divider()
 
+# --- 3.4 LAST BILL ENTERED ---
+st.header("🕐 Last Bill Entered")
+with st.expander("Check the most recent bill saved to the system", expanded=False):
+    if st.button("🔍 Check Last Bill Entered"):
+        last_entered_at, last_bill_df = get_last_entered_bill(df_materials_costing)
+
+        if last_entered_at is None:
+            st.info(
+                "No timestamped entries found yet. Only bills saved after this feature "
+                "shipped carry a save timestamp, so this will show your most recent "
+                "save once you save a new bill below."
+            )
+        else:
+            try:
+                local_dt = datetime.fromisoformat(last_entered_at)
+                when_str = local_dt.strftime('%Y-%m-%d %H:%M UTC')
+            except ValueError:
+                when_str = last_entered_at
+
+            first_row = last_bill_df.iloc[0]
+            st.success(
+                f"**Last bill entered:** {first_row.get('Bill_No', 'N/A')} from "
+                f"{first_row.get('Seller', 'N/A')}, dated {first_row.get('Date', 'N/A')} "
+                f"— saved {when_str}"
+            )
+            display_cols = [c for c in [
+                'Material', 'Qty_Purchase', 'Unit_Purchase', 'Rate_Purchase',
+                'Landed_Rate_Purchase', 'Cost_Pc', 'Total_Item_Cost',
+            ] if c in last_bill_df.columns]
+            st.dataframe(last_bill_df[display_cols], use_container_width=True, hide_index=True)
+
+st.divider()
+
 # --- 3.5 EDIT OR DELETE OLD BILLS ---
 st.header("✏️ Edit Old Bills")
 with st.expander("Modify or Delete an existing bill", expanded=False):
-    st.info(
-        "⏳ **Coming soon.** This section is being redesigned for the new "
-        "per-material costing history model - in the old Sheets-based "
-        "system, a 'bill' was a group of rows that could be edited or "
-        "deleted together. Now that each material keeps its own capped "
-        "history independently, editing a past bill means finding and "
-        "updating the matching entry inside *each* affected material's "
-        "history - a different, smaller operation than a single sheet "
-        "edit. This will be added back once that design is confirmed, "
-        "rather than shipping a version that might edit the wrong entries."
+    st.caption(
+        "A 'bill' here means every material line that shares the same Seller + Bill No. "
+        "Since each material only keeps its 5 most recent costings, a bill that's since "
+        "been superseded by 5+ newer purchases for a given material will no longer show "
+        "up for that material - that's a limit of the capped-history model, not a bug."
     )
+
+    ec1, ec2 = st.columns(2)
+    edit_seller = ec1.selectbox(
+        "Seller Company Name", options=existing_sellers, index=None,
+        placeholder="Select a Seller...", key="edit_bill_seller",
+    )
+    edit_bill_no = ec2.text_input("Bill No.", key="edit_bill_no")
+
+    use_date_filter = st.checkbox(
+        "Also match by Date (recommended if this Seller might have reused the same Bill No. across different years)",
+        key="edit_bill_use_date",
+    )
+    edit_date = st.date_input("Purchase Date", key="edit_bill_date") if use_date_filter else None
+
+    if edit_seller and edit_bill_no:
+        matches = find_bill_entries(
+            df_materials_costing, edit_seller, edit_bill_no,
+            date=str(edit_date) if edit_date else None,
+        )
+
+        if not matches:
+            date_note = f" on {edit_date}" if edit_date else ""
+            st.warning(
+                f"No entries found for Bill No. '{edit_bill_no}' from '{edit_seller}'{date_note} in "
+                "any material's current history. It may have aged out of the 5-entry cap, "
+                "or the Seller/Bill No.(/Date) may not match exactly."
+            )
+        else:
+            st.write(f"**Found {len(matches)} material line(s) on this bill:**")
+
+            match_df = pd.DataFrame(matches)
+            match_df.insert(0, "Select", False)
+
+            editable_cols = [
+                'Select', 'material', 'Date', 'Qty_Purchase', 'Rate_Purchase',
+                'Excise_Kg', 'Transport_Kg', 'Labour_Kg', 'Landed_Rate_Purchase',
+                'Cost_Pc', 'Total_Item_Cost', 'Qty_Sales',
+            ]
+            editable_cols = [c for c in editable_cols if c in match_df.columns]
+            display_df = match_df[editable_cols].rename(columns={'material': 'Material'})
+
+            st.caption(
+                "Edit values directly in the table below, then Save. Fields like Landed "
+                "Rate and Cost/Pc are NOT auto-recalculated from the others (the original "
+                "discount applied isn't stored), so update every affected field yourself."
+            )
+
+            edited_df = st.data_editor(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                disabled=['Material', 'Date'],
+                column_config={
+                    "Select": st.column_config.CheckboxColumn("Select", help="Check to delete this line"),
+                },
+                key="edit_bill_editor",
+            )
+
+            save_col, del_col = st.columns(2)
+
+            with save_col:
+                if st.button("💾 Save Edited Values"):
+                    results = {"ok": 0, "stale": 0, "missing": 0}
+                    for i, edited_row in edited_df.iterrows():
+                        original = matches[i]
+                        updated_fields = {
+                            k: edited_row[k] for k in [
+                                'Rate_Purchase', 'Excise_Kg', 'Transport_Kg', 'Labour_Kg',
+                                'Landed_Rate_Purchase', 'Cost_Pc', 'Total_Item_Cost',
+                                'Qty_Purchase', 'Qty_Sales',
+                            ] if k in edited_row
+                        }
+                        for k in updated_fields:
+                            updated_fields[k] = float(updated_fields[k] or 0)
+
+                        status = update_costing_entry(
+                            material=original['material'],
+                            entry_index=original['entry_index'],
+                            expected_entry=original,
+                            updated_fields=updated_fields,
+                        )
+                        results[status] = results.get(status, 0) + 1
+
+                    st.cache_data.clear()
+                    clear_lazy_cache()
+                    if results.get("stale") or results.get("missing"):
+                        st.warning(
+                            f"Saved {results['ok']} line(s), but {results.get('stale', 0) + results.get('missing', 0)} "
+                            "had changed since you loaded this page and were skipped. Refresh and try those again."
+                        )
+                    else:
+                        st.success(f"✅ Saved {results['ok']} line(s).")
+                    st.rerun()
+
+            with del_col:
+                selected_rows = edited_df[edited_df["Select"]]
+                if not selected_rows.empty:
+                    confirm_delete = st.checkbox(
+                        f"I understand this will permanently delete {len(selected_rows)} line(s).",
+                        key="edit_bill_delete_confirm",
+                    )
+                    if st.button("🗑️ Delete Selected Lines", type="primary", disabled=not confirm_delete):
+                        results = {"ok": 0, "stale": 0, "missing": 0}
+                        for i in selected_rows.index:
+                            original = matches[i]
+                            status = delete_costing_entry(
+                                material=original['material'],
+                                entry_index=original['entry_index'],
+                                expected_entry=original,
+                            )
+                            results[status] = results.get(status, 0) + 1
+
+                        st.cache_data.clear()
+                        clear_lazy_cache()
+                        if results.get("stale") or results.get("missing"):
+                            st.warning(
+                                f"Deleted {results['ok']} line(s), but {results.get('stale', 0) + results.get('missing', 0)} "
+                                "had changed since you loaded this page and were skipped. Refresh and try those again."
+                            )
+                        else:
+                            st.success(f"✅ Deleted {results['ok']} line(s).")
+                        st.rerun()
 
 # --- 4. BILL HEADER & DUPLICATE CHECK ---
 st.header("1. Bill Details")
@@ -536,6 +882,14 @@ if st.session_state.bill_items:
             # last 5, rather than rewriting the entire database on every
             # single save (the old Sheets version rewrote every row, every
             # time, regardless of how many materials were actually touched).
+            #
+            # One shared timestamp for every material in THIS bill (rather
+            # than a fresh one per iteration) is what lets get_last_entered_bill()
+            # and the Edit Old Bills search group them back together as
+            # "one bill" later, even though each material is stored as a
+            # separate document.
+            entered_at = datetime.now(timezone.utc).isoformat()
+
             for _, row in df_new_clean.iterrows():
                 material = str(row.get('Material', '')).strip()
                 if not material:
@@ -554,6 +908,7 @@ if st.session_state.bill_items:
                     "Qty_Sales": float(row.get("Qty_Sales", 0) or 0),
                     "Cost_Pc": float(row.get("Cost_Pc", 0) or 0),
                     "Total_Item_Cost": float(row.get("Total_Item_Cost", 0) or 0),
+                    "Entered_At": entered_at,
                 }
 
                 save_costing_entry(
@@ -566,6 +921,7 @@ if st.session_state.bill_items:
                 )
 
             st.cache_data.clear()
+            clear_lazy_cache()
             st.success("✅ Database updated! Blended costings were prioritized and saved.")
             st.balloons()
             st.session_state.bill_items = [] 
