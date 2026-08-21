@@ -23,6 +23,7 @@ PAGE_LABELS = {
     "inventory": "📦 Hardware Inventory",
     "costing": "💰 Costing Tool",
     "debtors": "🧾 Debtor Statements",
+    "data_cleanup": "🧹 Data Cleanup",
 }
 
 # Finer-grained than pages: a user can have the page but not a specific
