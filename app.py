@@ -8,7 +8,7 @@ st.set_page_config(page_title="Business Portal", layout="wide", page_icon="🏢"
 
 # --- 2. LOGIN (individual Google accounts, replaces the old shared password) ---
 if not st.user.is_logged_in:
-    st.title("🔒 Business Portal")
+    st.title("🔒 A S Concern Business Portal")
     st.write("Please log in with your Google account to continue.")
     if st.button("Log in with Google", type="primary"):
         st.login("google")
@@ -50,7 +50,7 @@ st.session_state.user_email = user_email
 # --- 4. ROLE + PAGE-ACCESS LOOKUP (with bootstrap-admin support for first-ever login) ---
 # Canonical page keys - used both for the checkboxes in Manage Users and for
 # each tool page's own access check.
-ALL_PAGE_KEYS = ["inventory", "costing", "debtors"]
+ALL_PAGE_KEYS = ["inventory", "costing", "debtors", "data_cleanup"]
 
 # Canonical FEATURE keys - finer-grained than pages. Someone can have access
 # to a whole page (e.g. "inventory") but still be blocked from a specific
@@ -190,6 +190,7 @@ PAGE_DEFINITIONS = {
     "inventory": st.Page("pages/1_hardware_inventory.py", title="Hardware Inventory", icon="📦"),
     "costing": st.Page("pages/2_costing_tool.py", title="Costing Tool", icon="💰"),
     "debtors": st.Page("pages/3_debtor_statements.py", title="Debtor Statements", icon="🧾"),
+    "data_cleanup": st.Page("pages/5_data_cleanup.py", title="Data Cleanup", icon="🧹"),
 }
 
 # Only show pages this specific user has been granted. This controls what's
