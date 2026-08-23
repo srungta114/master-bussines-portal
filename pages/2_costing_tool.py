@@ -206,6 +206,18 @@ def save_new_product(item_name, group, sub_group, purchase_unit, sales_unit, con
     return "ok"
 
 
+def delete_product(item_name):
+    """Deletes a SKU from product_master - the SAME collection Hardware
+    Inventory reads from, so removing it here removes it there too.
+    Does NOT touch materials_costing or purchases_fy: any existing costing
+    history or past transactions for this item are left exactly as they
+    are. The item just stops being selectable in search/entry dropdowns
+    going forward."""
+    db = st.session_state.db
+    doc_id = sanitize_doc_id(item_name)
+    db.collection("product_master").document(doc_id).delete()
+
+
 @st.cache_data(ttl=3600)
 def load_materials_costing():
     """One row per material, each with its own 'recent_costings' list (up to
@@ -737,6 +749,51 @@ with st.expander("Modify or Delete an existing bill", expanded=False):
                         else:
                             st.success(f"✅ Deleted {results['ok']} line(s).")
                         st.rerun()
+
+st.divider()
+
+# --- 3.6 DELETE A SKU ---
+st.header("🗑️ Delete a SKU")
+with st.expander("Remove an item from Product Master", expanded=False):
+    st.caption(
+        "This removes the item from Product Master only — shared with Hardware "
+        "Inventory, so deleting it here removes it there too. It does NOT delete "
+        "any existing costing history or past purchase transactions for this "
+        "item; those stay in the database exactly as they are, the item just "
+        "won't show up in search/entry dropdowns anymore."
+    )
+
+    all_items = sorted(df_master['Item_Name'].dropna().unique().tolist()) if 'Item_Name' in df_master.columns else []
+
+    delete_target = st.selectbox(
+        "Select SKU to delete", options=all_items, index=None,
+        placeholder="Search for an item...", key="delete_sku_select",
+    )
+
+    if delete_target:
+        has_costing_history = (
+            not df_materials_costing.empty
+            and 'Material' in df_materials_costing.columns
+            and delete_target in df_materials_costing['Material'].values
+        )
+        if has_costing_history:
+            st.warning(
+                f"⚠️ '{delete_target}' has existing costing history recorded. That "
+                "history won't be touched, but you'll lose the ability to search "
+                "for it by SKU once it's removed from Product Master."
+            )
+
+        confirm_sku_delete = st.checkbox(
+            f"I understand this will permanently remove '{delete_target}' from Product Master.",
+            key="delete_sku_confirm",
+        )
+        if st.button("🗑️ Delete SKU", type="primary", disabled=not confirm_sku_delete):
+            delete_product(delete_target)
+            st.cache_data.clear()
+            st.success(f"✅ Deleted '{delete_target}' from Product Master.")
+            st.rerun()
+
+st.divider()
 
 # --- 4. BILL HEADER & DUPLICATE CHECK ---
 st.header("1. Bill Details")
