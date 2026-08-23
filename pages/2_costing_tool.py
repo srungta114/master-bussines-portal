@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timezone
+from google.cloud import firestore
 
 # --- 1. SECURITY BOUNCER ---
 # If the memory was wiped (refresh) or they bypassed the login, stop the page from crashing.
@@ -206,16 +207,170 @@ def save_new_product(item_name, group, sub_group, purchase_unit, sales_unit, con
     return "ok"
 
 
+def check_sku_entries(item_name):
+    """Safety check run before any SKU delete is allowed to proceed.
+    Looks for recorded data against this item in every place it can live:
+      - materials_costing/{item}       - the Costing Tool's own cost history
+      - purchases_fy/*/entries          - every Hardware Inventory transaction
+        ever logged against this item, found via a targeted collection_group
+        query (NOT a full scan - reuses the same Item_Name single-field
+        index exemption the Item Ledger already depends on)
+      - stock_levels/{item}             - the running stock aggregate
+    Returns a dict summarizing what was found. The delete UI uses this to
+    decide whether a plain, unguarded delete is safe, or whether the user
+    must choose between wiping the entries too or transferring them to a
+    different SKU first."""
+    db = st.session_state.db
+    doc_id = sanitize_doc_id(item_name)
+
+    costing_entry_count = 0
+    if not df_materials_costing.empty and 'Material' in df_materials_costing.columns:
+        match = df_materials_costing[df_materials_costing['Material'] == item_name]
+        if not match.empty:
+            history = match.iloc[0].get('recent_costings') or []
+            costing_entry_count = len(history) if history else 1  # doc exists even with empty history
+
+    inventory_entry_count = len(list(
+        db.collection_group("entries").where("Item_Name", "==", item_name).stream()
+    ))
+
+    stock_doc = db.collection("stock_levels").document(doc_id).get()
+    stock_qty = stock_doc.to_dict().get("Net_Qty", 0) if stock_doc.exists else 0
+
+    return {
+        "costing_entry_count": costing_entry_count,
+        "inventory_entry_count": inventory_entry_count,
+        "stock_qty": stock_qty,
+        "has_any": costing_entry_count > 0 or inventory_entry_count > 0 or bool(stock_qty),
+    }
+
+
 def delete_product(item_name):
     """Deletes a SKU from product_master - the SAME collection Hardware
     Inventory reads from, so removing it here removes it there too.
     Does NOT touch materials_costing or purchases_fy: any existing costing
     history or past transactions for this item are left exactly as they
     are. The item just stops being selectable in search/entry dropdowns
-    going forward."""
+    going forward.
+
+    This is the "SKU has no recorded entries" path - see
+    delete_product_and_entries() / transfer_sku_entries() for what happens
+    when check_sku_entries() finds data attached to this item."""
     db = st.session_state.db
     doc_id = sanitize_doc_id(item_name)
     db.collection("product_master").document(doc_id).delete()
+
+
+def delete_product_and_entries(item_name):
+    """The 'delete everything' path for a SKU that check_sku_entries()
+    found has recorded data. Removes:
+      - every Hardware Inventory transaction doc for this item (targeted
+        deletes via collection_group query + batch, not a full-FY rewrite)
+      - the materials_costing/{item} doc (its whole capped cost history)
+      - the stock_levels/{item} aggregate doc
+      - the product_master/{item} doc itself
+    This is permanent and cannot be undone - the UI gates this behind an
+    explicit confirmation checkbox naming the entry counts involved."""
+    db = st.session_state.db
+    doc_id = sanitize_doc_id(item_name)
+
+    docs = list(db.collection_group("entries").where("Item_Name", "==", item_name).stream())
+    batch = db.batch()
+    count = 0
+    for d in docs:
+        batch.delete(d.reference)
+        count += 1
+        if count % 400 == 0:
+            batch.commit()
+            batch = db.batch()
+    if count % 400 != 0 or count == 0:
+        batch.commit()
+
+    db.collection("materials_costing").document(doc_id).delete()
+    db.collection("stock_levels").document(doc_id).delete()
+    db.collection("product_master").document(doc_id).delete()
+
+
+def transfer_sku_entries(old_name, new_name):
+    """The 'transfer to another SKU' path for a SKU that check_sku_entries()
+    found has recorded data. Moves every entry for old_name onto new_name,
+    then removes old_name from Product Master - used when a SKU is being
+    retired/merged into another one rather than genuinely wiped along with
+    its history. Targeted, batched writes only; no full-collection scans
+    or rewrites.
+
+      1. Hardware Inventory transactions: Item_Name field updated in place
+         on every matching doc (the doc itself isn't moved or recreated).
+      2. Costing history: old material's recent_costings are merged into
+         new material's (newest-first by Date, capped at
+         MAX_RECENT_COSTINGS, same rule save_costing_entry() applies), then
+         the old material doc is deleted. If new_name has no
+         materials_costing doc yet, one is created and seeded from the
+         merged history's newest entry.
+      3. Stock aggregate: old's Net_Qty is atomically added onto new's via
+         Increment(), then old's stock_levels doc is deleted.
+      4. old_name is removed from Product Master.
+    """
+    db = st.session_state.db
+    old_doc_id = sanitize_doc_id(old_name)
+    new_doc_id = sanitize_doc_id(new_name)
+
+    # 1. Hardware Inventory transactions
+    docs = list(db.collection_group("entries").where("Item_Name", "==", old_name).stream())
+    batch = db.batch()
+    count = 0
+    for d in docs:
+        batch.update(d.reference, {"Item_Name": new_name})
+        count += 1
+        if count % 400 == 0:
+            batch.commit()
+            batch = db.batch()
+    if count % 400 != 0 or count == 0:
+        batch.commit()
+
+    # 2. Costing history
+    old_ref = db.collection("materials_costing").document(old_doc_id)
+    old_snap = old_ref.get()
+    if old_snap.exists:
+        old_data = old_snap.to_dict()
+        old_history = old_data.get("recent_costings", [])
+
+        new_ref = db.collection("materials_costing").document(new_doc_id)
+        new_snap = new_ref.get()
+        new_history = new_snap.to_dict().get("recent_costings", []) if new_snap.exists else []
+
+        merged = new_history + old_history
+        merged_sorted = sorted(merged, key=lambda e: str(e.get("Date", "")), reverse=True)[:MAX_RECENT_COSTINGS]
+
+        update_fields = {"recent_costings": merged_sorted}
+        if not new_snap.exists:
+            # New material has no doc yet - seed its top-level fields so
+            # search/lookup works immediately, using the newest merged entry.
+            latest = merged_sorted[0] if merged_sorted else {}
+            update_fields.update({
+                "Material": new_name,
+                "Group": old_data.get("Group", ""),
+                "Sub-Group": old_data.get("Sub-Group", ""),
+                "Unit_Purchase": old_data.get("Unit_Purchase", ""),
+                "Unit_Sales": old_data.get("Unit_Sales", ""),
+                **latest,
+            })
+        new_ref.set(update_fields, merge=True)
+        old_ref.delete()
+
+    # 3. Stock aggregate
+    old_stock_ref = db.collection("stock_levels").document(old_doc_id)
+    old_stock_snap = old_stock_ref.get()
+    if old_stock_snap.exists:
+        old_qty = old_stock_snap.to_dict().get("Net_Qty", 0) or 0
+        if old_qty:
+            db.collection("stock_levels").document(new_doc_id).set(
+                {"Net_Qty": firestore.Increment(old_qty)}, merge=True
+            )
+        old_stock_ref.delete()
+
+    # 4. Remove old SKU from Product Master
+    db.collection("product_master").document(old_doc_id).delete()
 
 
 @st.cache_data(ttl=3600)
@@ -757,10 +912,10 @@ st.header("🗑️ Delete a SKU")
 with st.expander("Remove an item from Product Master", expanded=False):
     st.caption(
         "This removes the item from Product Master only — shared with Hardware "
-        "Inventory, so deleting it here removes it there too. It does NOT delete "
-        "any existing costing history or past purchase transactions for this "
-        "item; those stay in the database exactly as they are, the item just "
-        "won't show up in search/entry dropdowns anymore."
+        "Inventory, so deleting it here removes it there too. Before anything is "
+        "deleted, this checks whether the SKU has any recorded entries anywhere "
+        "in the database (costing history, Hardware Inventory transactions, or "
+        "stock on hand)."
     )
 
     all_items = sorted(df_master['Item_Name'].dropna().unique().tolist()) if 'Item_Name' in df_master.columns else []
@@ -771,27 +926,68 @@ with st.expander("Remove an item from Product Master", expanded=False):
     )
 
     if delete_target:
-        has_costing_history = (
-            not df_materials_costing.empty
-            and 'Material' in df_materials_costing.columns
-            and delete_target in df_materials_costing['Material'].values
-        )
-        if has_costing_history:
+        usage = check_sku_entries(delete_target)
+
+        if not usage["has_any"]:
+            st.info(f"No recorded entries found for '{delete_target}' anywhere in the database — safe to delete.")
+            confirm_sku_delete = st.checkbox(
+                f"I understand this will permanently remove '{delete_target}' from Product Master.",
+                key="delete_sku_confirm",
+            )
+            if st.button("🗑️ Delete SKU", type="primary", disabled=not confirm_sku_delete):
+                delete_product(delete_target)
+                st.cache_data.clear()
+                st.success(f"✅ Deleted '{delete_target}' from Product Master.")
+                st.rerun()
+
+        else:
             st.warning(
-                f"⚠️ '{delete_target}' has existing costing history recorded. That "
-                "history won't be touched, but you'll lose the ability to search "
-                "for it by SKU once it's removed from Product Master."
+                f"⚠️ '{delete_target}' has recorded entries:\n"
+                f"- **{usage['costing_entry_count']}** costing history entr{'y' if usage['costing_entry_count'] == 1 else 'ies'}\n"
+                f"- **{usage['inventory_entry_count']}** Hardware Inventory transaction(s)\n"
+                f"- **{usage['stock_qty']}** unit(s) currently on record as stock\n\n"
+                "Deleting the SKU outright will orphan this data. Choose how to proceed:"
             )
 
-        confirm_sku_delete = st.checkbox(
-            f"I understand this will permanently remove '{delete_target}' from Product Master.",
-            key="delete_sku_confirm",
-        )
-        if st.button("🗑️ Delete SKU", type="primary", disabled=not confirm_sku_delete):
-            delete_product(delete_target)
-            st.cache_data.clear()
-            st.success(f"✅ Deleted '{delete_target}' from Product Master.")
-            st.rerun()
+            action = st.radio(
+                "How should these entries be handled?",
+                options=["Delete the entries too", "Transfer entries to another SKU"],
+                index=None, key="delete_sku_action",
+            )
+
+            if action == "Delete the entries too":
+                confirm_full_delete = st.checkbox(
+                    f"I understand this will permanently delete '{delete_target}' AND all "
+                    f"{usage['costing_entry_count']} costing entr{'y' if usage['costing_entry_count'] == 1 else 'ies'} and "
+                    f"{usage['inventory_entry_count']} inventory transaction(s) tied to it. This cannot be undone.",
+                    key="delete_sku_full_confirm",
+                )
+                if st.button("🗑️ Delete SKU and All Its Entries", type="primary", disabled=not confirm_full_delete):
+                    delete_product_and_entries(delete_target)
+                    st.cache_data.clear()
+                    clear_lazy_cache()
+                    st.success(f"✅ Deleted '{delete_target}' and all its recorded entries.")
+                    st.rerun()
+
+            elif action == "Transfer entries to another SKU":
+                transfer_options = [i for i in all_items if i != delete_target]
+                transfer_target = st.selectbox(
+                    "Transfer all entries to which SKU?", options=transfer_options, index=None,
+                    placeholder="Select the destination SKU...", key="delete_sku_transfer_target",
+                )
+                if transfer_target:
+                    confirm_transfer = st.checkbox(
+                        f"I understand this will move all costing history, inventory transactions, "
+                        f"and stock from '{delete_target}' onto '{transfer_target}', then delete '{delete_target}' "
+                        "from Product Master. This cannot be undone.",
+                        key="delete_sku_transfer_confirm",
+                    )
+                    if st.button("🔀 Transfer Entries & Delete SKU", type="primary", disabled=not confirm_transfer):
+                        transfer_sku_entries(delete_target, transfer_target)
+                        st.cache_data.clear()
+                        clear_lazy_cache()
+                        st.success(f"✅ Transferred all entries from '{delete_target}' to '{transfer_target}' and removed '{delete_target}'.")
+                        st.rerun()
 
 st.divider()
 
