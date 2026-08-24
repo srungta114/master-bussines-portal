@@ -1452,8 +1452,26 @@ with tab2:
                                 })
                                 continue 
                     
-                            matched_item, debug_log = find_best_match(merged_description, mapped_keywords=mapping_kw)
-                            debug_str = format_debug_string(debug_log)
+                            # DIRECT CODE MATCH (runs BEFORE fuzzy matching, takes priority
+                            # over it): if this row's item code has a known mapping in
+                            # Firestore's code_mapping collection, and that mapped name is a
+                            # real Product Master entry, trust it outright instead of handing
+                            # it to the fuzzy engine. Without this, a perfectly good code ->
+                            # name mapping from the database could still get missed or
+                            # second-guessed by fuzzy matching (wrong threshold, a slightly
+                            # different phrasing, etc). A known code is a known code - it
+                            # shouldn't need to be "found" again.
+                            matched_item = None
+                            debug_str = ""
+                            if raw_item_code and raw_item_code in code_dict:
+                                candidate_name = code_dict[raw_item_code].strip()
+                                if candidate_name and candidate_name.lower() != 'nan' and candidate_name in products_df['Item_Name'].values:
+                                    matched_item = candidate_name
+                                    debug_str = f"🟢 Direct Code Match ({raw_item_code} → {candidate_name}, from Firestore code_mapping)"
+
+                            if matched_item is None:
+                                matched_item, debug_log = find_best_match(merged_description, mapped_keywords=mapping_kw)
+                                debug_str = format_debug_string(debug_log)
                     
                             if matched_item:
                                 item_details = products_df[products_df['Item_Name'] == matched_item].iloc[0]
