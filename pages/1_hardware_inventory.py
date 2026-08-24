@@ -1885,7 +1885,18 @@ with tab5:
                     display_df = bill_data.drop(columns=[c for c in cols_to_drop if c in bill_data.columns])
             
                     st.write("✏️ **Edit quantities or details below:**")
-                    edited_df = st.data_editor(display_df, use_container_width=True)
+                    edited_df = st.data_editor(
+                        display_df,
+                        column_config={
+                            "Item_Name": st.column_config.SelectboxColumn(
+                                "Item_Name (Editable)",
+                                help="Select the correct master product",
+                                options=sorted(products_df['Item_Name'].dropna().unique().tolist()),
+                                required=True
+                            ),
+                        } if 'Item_Name' in display_df.columns else None,
+                        use_container_width=True,
+                    )
 
                     if st.button("💾 Save Transaction Changes", type="primary"):
                         # Targeted per-document updates - each row is written back
