@@ -506,6 +506,22 @@ def clear_lazy_cache():
     for k in ("sd_purchases_df", "sd_stock_df"):
         st.session_state.pop(k, None)
 
+
+def normalize_code(x):
+    """Normalizes an item code for matching, regardless of whether it came
+    in as a clean string or as something pandas silently turned into a
+    number. A code column with even one blank cell gets upcast to float64
+    by pandas, turning "5001" into 5001.0 - str(row[4]) then reads back as
+    "5001.0" and will never match a code_dict key of "5001". This strips
+    that artifact. It also guards against the same thing happening to
+    codes read out of Firestore/mapping_df."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+    return s
+
 mapping_df = get_code_mapping()
 learned_df = get_learned_mappings()
 
@@ -514,9 +530,9 @@ code_dict = {}
 unit_dict = {}
 if not mapping_df.empty:
     if len(mapping_df.columns) >= 2:
-        code_dict = dict(zip(mapping_df.iloc[:, 0].astype(str).str.strip(), mapping_df.iloc[:, 1].astype(str).str.strip()))
+        code_dict = dict(zip(mapping_df.iloc[:, 0].apply(normalize_code), mapping_df.iloc[:, 1].astype(str).str.strip()))
     if len(mapping_df.columns) >= 3:
-        unit_dict = dict(zip(mapping_df.iloc[:, 0].astype(str).str.strip(), mapping_df.iloc[:, 2].astype(str).str.strip()))
+        unit_dict = dict(zip(mapping_df.iloc[:, 0].apply(normalize_code), mapping_df.iloc[:, 2].astype(str).str.strip()))
 
 # 2. Create the AI Memory dictionary
 memory_dict = {}
@@ -1306,9 +1322,16 @@ with tab2:
                     if "processed_file_name" not in st.session_state or st.session_state.processed_file_name != uploaded_file.name:
                         try:
                             if uploaded_file.name.endswith('.csv'):
-                                df_upload = pd.read_csv(uploaded_file, header=None)
+                                # dtype={4: str} on the item-code column is deliberate: without
+                                # it, pandas infers the column's type from the data, and a
+                                # single blank cell anywhere in that column is enough to upcast
+                                # the WHOLE column to float64 (so "5001" silently becomes
+                                # 5001.0), or leading zeros get eaten (so "007" becomes 7).
+                                # Either way the code_dict lookup below then never matches, and
+                                # the raw code shows through instead of the product name.
+                                df_upload = pd.read_csv(uploaded_file, header=None, dtype={4: str})
                             else:
-                                df_upload = pd.read_excel(uploaded_file, header=None)
+                                df_upload = pd.read_excel(uploaded_file, header=None, dtype={4: str})
                     
                             df_upload[1] = df_upload[1].astype(str).str.strip()
                             uploaded_bills_count = df_upload.groupby(1).size().to_dict()
@@ -1388,7 +1411,7 @@ with tab2:
                             qty_val = 0.0 if pd.isna(qty_val) else float(qty_val)
                     
                             sales_unit = str(row[9]).strip() if len(row) > 9 and pd.notna(row[9]) else ""
-                            raw_item_code = str(row[4]).strip() if len(row) > 4 and pd.notna(row[4]) else ""
+                            raw_item_code = normalize_code(row[4]) if len(row) > 4 else ""
                             other_desc = str(row[5]).strip() if len(row) > 5 and pd.notna(row[5]) else ""
                     
                             mapped_name = code_dict.get(raw_item_code, raw_item_code)
