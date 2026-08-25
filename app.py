@@ -44,8 +44,23 @@ if "sh" not in st.session_state:
         st.error(f"Google Sheets Authentication Failed: {e}")
         st.stop()
 
-user_email = st.user.email.strip().lower()
+user_email = (st.user.email or "").strip().lower()
 st.session_state.user_email = user_email
+
+# GUARD: user_email is used directly as a Firestore document ID everywhere
+# in this app (here, and in Manage Users). An empty string is an INVALID
+# Firestore document ID and would crash on the very next line with an
+# unreadable error. This happens if Google's OAuth response doesn't
+# include an email claim for some reason (e.g. the account's email scope
+# wasn't granted) - st.user.is_logged_in can be True while st.user.email
+# is still empty. Catching it here turns that into a clear message instead.
+if not user_email or "@" not in user_email:
+    st.error(
+        "🔒 Couldn't read a valid email address from your Google login. "
+        "Please log out and try logging in again - if this keeps happening, "
+        "contact an administrator."
+    )
+    st.stop()
 
 # --- 4. ROLE + PAGE-ACCESS LOOKUP (with bootstrap-admin support for first-ever login) ---
 # Canonical page keys - used both for the checkboxes in Manage Users and for
