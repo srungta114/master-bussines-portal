@@ -8,7 +8,7 @@ st.set_page_config(page_title="Business Portal", layout="wide", page_icon="🏢"
 
 # --- 2. LOGIN (individual Google accounts, replaces the old shared password) ---
 if not st.user.is_logged_in:
-    st.title("🔒 Business Portal")
+    st.title("🔒 A S Concern Business Portal")
     st.write("Please log in with your Google account to continue.")
     if st.button("Log in with Google", type="primary"):
         st.login("google")
@@ -44,8 +44,26 @@ if "sh" not in st.session_state:
         st.error(f"Google Sheets Authentication Failed: {e}")
         st.stop()
 
-user_email = st.user.email.strip().lower()
+user_email = (st.user.email or "").strip().lower()
 st.session_state.user_email = user_email
+
+# GUARD: user_email is used directly as a Firestore document ID everywhere
+# in this app (here, and in Manage Users). An empty string is an INVALID
+# Firestore document ID - db.collection("users").document("") raises
+# exactly the InvalidArgument seen here, deep inside batch_get_documents,
+# with no useful message surfaced to the user. This happens when Google's
+# OAuth response doesn't include an email claim for some reason (e.g. the
+# account's email scope wasn't granted, or an edge case in st.login()'s
+# token handling) - st.user.is_logged_in can be True while st.user.email
+# is still empty. Catching it here turns a raw, unreadable stack trace
+# into a clear, actionable message instead.
+if not user_email or "@" not in user_email:
+    st.error(
+        "🔒 Couldn't read a valid email address from your Google login. "
+        "Please log out and try logging in again - if this keeps happening, "
+        "contact an administrator."
+    )
+    st.stop()
 
 # --- 4. ROLE + PAGE-ACCESS LOOKUP (with bootstrap-admin support for first-ever login) ---
 # Canonical page keys - used both for the checkboxes in Manage Users and for
