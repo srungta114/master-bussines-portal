@@ -149,7 +149,7 @@ def render_add_new_sku_form(df_master, key_prefix, select_after_create_key=None)
                 if status == "duplicate":
                     st.error(f"'{new_item_name.strip()}' already exists in Product Master - search for it above instead.")
                 else:
-                    st.cache_data.clear()
+                    load_products.clear()
                     for k in field_keys:
                         st.session_state.pop(k, None)
                     if select_after_create_key:
@@ -230,9 +230,17 @@ def check_sku_entries(item_name):
             history = match.iloc[0].get('recent_costings') or []
             costing_entry_count = len(history) if history else 1  # doc exists even with empty history
 
-    inventory_entry_count = len(list(
-        db.collection_group("entries").where("Item_Name", "==", item_name).stream()
-    ))
+    # .count() aggregation query, NOT .stream() + len(list(...)). The
+    # earlier version read and billed for every single matching document
+    # just to produce a number - for an item with hundreds of transactions,
+    # that's hundreds of reads every time this SKU is merely selected in
+    # the dropdown (this runs automatically, not gated behind a button).
+    # Firestore's aggregation count is billed far more cheaply than reading
+    # the underlying documents, since it doesn't return their content.
+    count_result = (
+        db.collection_group("entries").where("Item_Name", "==", item_name).count().get()
+    )
+    inventory_entry_count = count_result[0][0].value
 
     stock_doc = db.collection("stock_levels").document(doc_id).get()
     stock_qty = stock_doc.to_dict().get("Net_Qty", 0) if stock_doc.exists else 0
@@ -865,7 +873,7 @@ with st.expander("Modify or Delete an existing bill", expanded=False):
                         )
                         results[status] = results.get(status, 0) + 1
 
-                    st.cache_data.clear()
+                    load_materials_costing.clear()
                     clear_lazy_cache()
                     if results.get("stale") or results.get("missing"):
                         st.warning(
@@ -894,7 +902,7 @@ with st.expander("Modify or Delete an existing bill", expanded=False):
                             )
                             results[status] = results.get(status, 0) + 1
 
-                        st.cache_data.clear()
+                        load_materials_costing.clear()
                         clear_lazy_cache()
                         if results.get("stale") or results.get("missing"):
                             st.warning(
@@ -936,7 +944,7 @@ with st.expander("Remove an item from Product Master", expanded=False):
             )
             if st.button("🗑️ Delete SKU", type="primary", disabled=not confirm_sku_delete):
                 delete_product(delete_target)
-                st.cache_data.clear()
+                load_products.clear()
                 st.success(f"✅ Deleted '{delete_target}' from Product Master.")
                 st.rerun()
 
@@ -964,6 +972,13 @@ with st.expander("Remove an item from Product Master", expanded=False):
                 )
                 if st.button("🗑️ Delete SKU and All Its Entries", type="primary", disabled=not confirm_full_delete):
                     delete_product_and_entries(delete_target)
+                    # Blanket clear kept here deliberately (unlike the targeted
+                    # .clear() calls elsewhere in this file): this also deletes
+                    # purchases_fy/stock_levels documents, which are cached by
+                    # get_purchases()/get_stock_levels() in the Hardware
+                    # Inventory page - a separate page module this file has no
+                    # direct function handle on, so a blanket clear is the only
+                    # way to invalidate that page's cache too.
                     st.cache_data.clear()
                     clear_lazy_cache()
                     st.success(f"✅ Deleted '{delete_target}' and all its recorded entries.")
@@ -984,6 +999,9 @@ with st.expander("Remove an item from Product Master", expanded=False):
                     )
                     if st.button("🔀 Transfer Entries & Delete SKU", type="primary", disabled=not confirm_transfer):
                         transfer_sku_entries(delete_target, transfer_target)
+                        # Same reasoning as the delete-and-entries path above:
+                        # this touches purchases_fy/stock_levels, cached by the
+                        # Hardware Inventory page, so a blanket clear is kept.
                         st.cache_data.clear()
                         clear_lazy_cache()
                         st.success(f"✅ Transferred all entries from '{delete_target}' to '{transfer_target}' and removed '{delete_target}'.")
@@ -1297,7 +1315,7 @@ if st.session_state.bill_items:
                     entry=entry,
                 )
 
-            st.cache_data.clear()
+            load_materials_costing.clear()
             clear_lazy_cache()
             st.success("✅ Database updated! Blended costings were prioritized and saved.")
             st.balloons()
