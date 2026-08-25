@@ -20,16 +20,7 @@ if "db" not in st.session_state:
     try:
         creds_dict = dict(st.secrets["firestore"])
         creds = Credentials.from_service_account_info(creds_dict)
-        # database="(default)" passed explicitly, not left as None. The
-        # implicit None -> "(default)" resolution is what was producing
-        # "Invalid database id (default)" - the console confirms the
-        # database really is named (default), so this isn't a config
-        # mismatch, it's that resolution path misbehaving. Passing the
-        # literal value directly skips whatever that internal logic does
-        # and sends it straight through.
-        st.session_state.db = firestore.Client(
-            credentials=creds, project=creds_dict["project_id"], database="(default)"
-        )
+        st.session_state.db = firestore.Client(credentials=creds, project=creds_dict["project_id"])
     except Exception as e:
         st.error("Could not connect to the database. Please contact the administrator.")
         st.stop()
@@ -53,26 +44,8 @@ if "sh" not in st.session_state:
         st.error(f"Google Sheets Authentication Failed: {e}")
         st.stop()
 
-user_email = (st.user.email or "").strip().lower()
+user_email = st.user.email.strip().lower()
 st.session_state.user_email = user_email
-
-# GUARD: user_email is used directly as a Firestore document ID everywhere
-# in this app (here, and in Manage Users). An empty string is an INVALID
-# Firestore document ID - db.collection("users").document("") raises
-# exactly the InvalidArgument seen here, deep inside batch_get_documents,
-# with no useful message surfaced to the user. This happens when Google's
-# OAuth response doesn't include an email claim for some reason (e.g. the
-# account's email scope wasn't granted, or an edge case in st.login()'s
-# token handling) - st.user.is_logged_in can be True while st.user.email
-# is still empty. Catching it here turns a raw, unreadable stack trace
-# into a clear, actionable message instead.
-if not user_email or "@" not in user_email:
-    st.error(
-        "🔒 Couldn't read a valid email address from your Google login. "
-        "Please log out and try logging in again - if this keeps happening, "
-        "contact an administrator."
-    )
-    st.stop()
 
 # --- 4. ROLE + PAGE-ACCESS LOOKUP (with bootstrap-admin support for first-ever login) ---
 # Canonical page keys - used both for the checkboxes in Manage Users and for
@@ -94,25 +67,8 @@ ALL_PERMISSION_KEYS = [
 ]
 
 if "user_role" not in st.session_state:
-    # Wrapped in try/except deliberately: Streamlit Cloud redacts the real
-    # message on an UNCAUGHT exception ("original error message is
-    # redacted to prevent data leaks"), which is exactly why the previous
-    # InvalidArgument traceback showed WHERE this failed but not WHY. By
-    # catching it ourselves and displaying it, we bypass that redaction and
-    # get the actual reason Firestore rejected the request - needed to fix
-    # the real cause instead of guessing at it again.
-    try:
-        user_ref = db.collection("users").document(user_email)
-        user_doc = user_ref.get()
-    except Exception as e:
-        st.error(
-            "🔒 Couldn't look up your account in the database.\n\n"
-            f"Debug info - email: `{user_email!r}` (length {len(user_email)})\n\n"
-            f"Debug info - project_id in use: `{creds_dict.get('project_id')!r}`\n\n"
-            f"Error: `{type(e).__name__}: {e}`\n\n"
-            "Please screenshot this and share it so it can be fixed."
-        )
-        st.stop()
+    user_ref = db.collection("users").document(user_email)
+    user_doc = user_ref.get()
 
     if user_doc.exists:
         data = user_doc.to_dict()
