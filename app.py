@@ -20,7 +20,16 @@ if "db" not in st.session_state:
     try:
         creds_dict = dict(st.secrets["firestore"])
         creds = Credentials.from_service_account_info(creds_dict)
-        st.session_state.db = firestore.Client(credentials=creds, project=creds_dict["project_id"])
+        # database="(default)" passed explicitly, not left as None. The
+        # implicit None -> "(default)" resolution is what was producing
+        # "Invalid database id (default)" - the console confirms the
+        # database really is named (default), so this isn't a config
+        # mismatch, it's that resolution path misbehaving. Passing the
+        # literal value directly skips whatever that internal logic does
+        # and sends it straight through.
+        st.session_state.db = firestore.Client(
+            credentials=creds, project=creds_dict["project_id"], database="(default)"
+        )
     except Exception as e:
         st.error("Could not connect to the database. Please contact the administrator.")
         st.stop()
