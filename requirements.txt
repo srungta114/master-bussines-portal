@@ -6,6 +6,6 @@ st-gsheets-connection
 pypdf
 reportlab
 streamlit>=1.42.0
-google-cloud-firestore==2.22.0
+google-cloud-firestore
 Authlib
 httpx
