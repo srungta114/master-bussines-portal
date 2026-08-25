@@ -85,8 +85,24 @@ ALL_PERMISSION_KEYS = [
 ]
 
 if "user_role" not in st.session_state:
-    user_ref = db.collection("users").document(user_email)
-    user_doc = user_ref.get()
+    # Wrapped in try/except deliberately: Streamlit Cloud redacts the real
+    # message on an UNCAUGHT exception ("original error message is
+    # redacted to prevent data leaks"), which is exactly why the previous
+    # InvalidArgument traceback showed WHERE this failed but not WHY. By
+    # catching it ourselves and displaying it, we bypass that redaction and
+    # get the actual reason Firestore rejected the request - needed to fix
+    # the real cause instead of guessing at it again.
+    try:
+        user_ref = db.collection("users").document(user_email)
+        user_doc = user_ref.get()
+    except Exception as e:
+        st.error(
+            "🔒 Couldn't look up your account in the database.\n\n"
+            f"Debug info - email: `{user_email!r}` (length {len(user_email)})\n\n"
+            f"Error: `{type(e).__name__}: {e}`\n\n"
+            "Please screenshot this and share it so it can be fixed."
+        )
+        st.stop()
 
     if user_doc.exists:
         data = user_doc.to_dict()
