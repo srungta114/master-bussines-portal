@@ -108,6 +108,7 @@ if "user_role" not in st.session_state:
         st.error(
             "🔒 Couldn't look up your account in the database.\n\n"
             f"Debug info - email: `{user_email!r}` (length {len(user_email)})\n\n"
+            f"Debug info - project_id in use: `{creds_dict.get('project_id')!r}`\n\n"
             f"Error: `{type(e).__name__}: {e}`\n\n"
             "Please screenshot this and share it so it can be fixed."
         )
