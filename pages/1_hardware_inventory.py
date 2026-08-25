@@ -101,11 +101,31 @@ def save_new_product(item_name, group, sub_group, purchase_unit, sales_unit):
     return "ok"
 
 @st.cache_data(ttl=3600)
-def get_purchases():
+def get_fiscal_years():
+    """Cheaply lists which fiscal years have recorded data, WITHOUT reading
+    any document content. list_documents() returns document REFERENCES
+    only (essentially free/metadata-only) - unlike .stream(), which reads
+    and bills for every document's full content. Used to populate the
+    fiscal-year picker so a full multi-year scan is opt-in, not automatic."""
+    try:
+        db = st.session_state.db
+        refs = db.collection("purchases_fy").list_documents()
+        return sorted([r.id for r in refs], reverse=True)
+    except Exception:
+        return []
+
+@st.cache_data(ttl=3600)
+def get_purchases(fiscal_year=None):
     # Every fiscal year's transactions live in their own subcollection at
-    # purchases_fy/{fy}/entries. A collection_group query reads across every
-    # one of those subcollections in a single call, replacing the old
-    # "loop every FY worksheet" pattern.
+    # purchases_fy/{fy}/entries.
+    #
+    # fiscal_year=None (or "All Years") does a collection_group query,
+    # reading across EVERY subcollection - one billed read per document,
+    # across your entire multi-year history. This is the single biggest
+    # read-cost driver in the app and should be an explicit, opt-in choice,
+    # not the default. Passing a specific fiscal_year instead reads only
+    # that one subcollection, which is dramatically cheaper for the common
+    # case of working with recent/current-year transactions.
     #
     # _doc_id/_fy_doc_id are captured (and NOT written back to Firestore -
     # they're stripped before any save) so that editing or deleting a
@@ -114,12 +134,17 @@ def get_purchases():
     # touch one row.
     try:
         db = st.session_state.db
-        docs = db.collection_group("entries").stream()
+        if fiscal_year and fiscal_year != "All Years":
+            docs = db.collection("purchases_fy").document(fiscal_year).collection("entries").stream()
+            fy_doc_id_override = fiscal_year
+        else:
+            docs = db.collection_group("entries").stream()
+            fy_doc_id_override = None
         records = []
         for d in docs:
             row = d.to_dict()
             row['_doc_id'] = d.id
-            row['_fy_doc_id'] = d.reference.parent.parent.id
+            row['_fy_doc_id'] = fy_doc_id_override or d.reference.parent.parent.id
             records.append(row)
         return pd.DataFrame(records) if records else pd.DataFrame()
     except Exception:
@@ -471,15 +496,44 @@ products_df = get_product_master()
 # the local load_purchases() helper below - so a user who only has, say,
 # Masters & AI Memory access never triggers it at all.
 
-def load_purchases():
+def load_purchases(fiscal_year=None):
     """On-demand purchases loader - call this from inside a tab body right
     before the data is actually needed, not at module level. Cached by
     get_purchases() itself, so calling this more than once in the same tab
-    or across tabs within the same rerun is free."""
-    df = get_purchases()
+    or across tabs within the same rerun is free. Pass a specific
+    fiscal_year to scope the read to just that year (much cheaper);
+    omit it (or pass "All Years") for the full multi-year scan."""
+    df = get_purchases(fiscal_year)
     if not df.empty and 'Date' in df.columns:
         df['Fiscal Year'] = df['Date'].apply(get_nepali_fiscal_year)
     return df
+
+
+def render_purchases_loader(widget_key):
+    """Renders a fiscal-year picker plus a Load/Refresh button, and returns
+    the loaded purchases DataFrame (or None if not yet loaded). Loading is
+    scoped to ONE fiscal year at a time by default, defaulting to the
+    current year - a full "All Years" scan reads every transaction ever
+    recorded and is opt-in only, since it's the single biggest read-cost
+    driver in this app."""
+    fy_options = ["All Years"] + get_fiscal_years()
+    default_fy = get_nepali_fiscal_year(datetime.now())
+    default_index = fy_options.index(default_fy) if default_fy in fy_options else (1 if len(fy_options) > 1 else 0)
+    selected_fy = st.selectbox(
+        "Fiscal Year to load", options=fy_options, index=default_index,
+        key=f"fy_select_{widget_key}",
+        help="Loading a single fiscal year reads far fewer documents than 'All Years'. Only pick 'All Years' if you actually need cross-year data.",
+    )
+    if selected_fy == "All Years":
+        st.caption("⚠️ 'All Years' reads your ENTIRE transaction history - this can use a large share of your daily Firestore read quota.")
+
+    session_key = f"sd_purchases_df::{selected_fy}"
+    return lazy_load(
+        session_key,
+        lambda: load_purchases(None if selected_fy == "All Years" else selected_fy),
+        f"Transaction Data ({selected_fy})",
+        widget_key=f"{widget_key}_{selected_fy}",
+    )
 
 
 def lazy_load(session_key, loader_fn, label, widget_key=None):
@@ -525,11 +579,14 @@ def lazy_load(session_key, loader_fn, label, widget_key=None):
 
 
 def clear_lazy_cache():
-    """Call this alongside st.cache_data.clear() after any write, so the
-    next view of a lazily-loaded tab is forced to fetch fresh data instead
-    of continuing to show whatever was loaded before the edit."""
-    for k in ("sd_purchases_df", "sd_stock_df"):
-        st.session_state.pop(k, None)
+    """Call this after any write, so the next view of a lazily-loaded tab
+    is forced to fetch fresh data instead of continuing to show whatever
+    was loaded before the edit. Purchases session keys are now scoped per
+    fiscal year (sd_purchases_df::<fy>), so this clears all of them by
+    prefix rather than a single fixed key."""
+    for k in list(st.session_state.keys()):
+        if k.startswith("sd_purchases_df") or k == "sd_stock_df":
+            st.session_state.pop(k, None)
 
 
 def normalize_code(x):
@@ -1168,7 +1225,7 @@ def render_add_new_sku_form(products_df, key_prefix, select_after_create_key=Non
                 if status == "duplicate":
                     st.error(f"'{new_item_name.strip()}' already exists in Product Master - search for it above instead.")
                 else:
-                    st.cache_data.clear()
+                    get_product_master.clear()
                     for k in field_keys:
                         st.session_state.pop(k, None)
                     if select_after_create_key:
@@ -1188,7 +1245,7 @@ with tab1:
     if "inventory_single_entry" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Adding new transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data", widget_key="purchases_tab1")
+        purchases_df = render_purchases_loader("purchases_tab1")
 
         if purchases_df is None:
             pass  # lazy_load already showed the Load button + caption above
@@ -1336,7 +1393,8 @@ with tab1:
                             new_records_df = pd.DataFrame(records_to_save)
                             append_purchases(new_records_df)
                             st.session_state.single_entry_cart = []
-                            st.cache_data.clear()
+                            get_purchases.clear()
+                            get_stock_levels.clear()
                             clear_lazy_cache()
                             st.success(f"✅ Successfully saved {len(records_to_save)} items under Ref/Bill: {bill_number}")
                             st.rerun()
@@ -1351,7 +1409,7 @@ with tab2:
     if "inventory_bulk_upload" not in st.session_state.get("user_permissions", []):
         st.info("🔒 Bulk uploading transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data", widget_key="purchases_tab2")
+        purchases_df = render_purchases_loader("purchases_tab2")
 
         if purchases_df is None:
             pass  # lazy_load already showed the Load button + caption above
@@ -1599,7 +1657,9 @@ with tab2:
                                 updated_learnings = updated_learnings.drop_duplicates(subset=["Billed_Description"], keep="last")
                                 save_learned_mappings(updated_learnings)
                     
-                            st.cache_data.clear()
+                            get_purchases.clear()
+                            get_stock_levels.clear()
+                            get_learned_mappings.clear()
                             clear_lazy_cache()
                             st.session_state.committed_file_name = st.session_state.processed_file_name
                     
@@ -1835,7 +1895,7 @@ with tab4:
                 clean_df['Billed_Description'] = clean_df['Billed_Description'].astype(str).str.strip().str.upper()
                 clean_df = clean_df.drop_duplicates(subset=["Billed_Description"], keep="last")
                 save_learned_mappings(clean_df)
-                st.cache_data.clear()
+                get_learned_mappings.clear()
                 clear_lazy_cache()
                 st.success("✅ AI Memory Optimized! All duplicate formatting variations have been removed.")
                 st.rerun()
@@ -1852,7 +1912,7 @@ with tab5:
     if not _has_edit_perm and not _has_delete_perm:
         st.info("🔒 Editing or deleting transactions requires a permission an administrator hasn't granted your account yet.")
     else:
-        purchases_df = lazy_load("sd_purchases_df", load_purchases, "Transaction Data", widget_key="purchases_tab5")
+        purchases_df = render_purchases_loader("purchases_tab5")
 
         if purchases_df is None:
             pass  # lazy_load already showed the Load button + caption above
@@ -1938,7 +1998,8 @@ with tab5:
                                 append_purchases(pd.DataFrame([updated_fields]))
                                 results["moved"] += 1
 
-                        st.cache_data.clear()
+                        get_purchases.clear()
+                        get_stock_levels.clear()
                         clear_lazy_cache()
                         if results.get("missing"):
                             st.warning(
@@ -2027,7 +2088,8 @@ with tab5:
                             # the fiscal year(s) they happen to live in.
                             delete_purchase_entries(rows_to_delete.to_dict('records'))
 
-                            st.cache_data.clear()
+                            get_purchases.clear()
+                            get_stock_levels.clear()
                             clear_lazy_cache()
                             st.success(f"✅ Deleted {len(selected_bills)} bill(s) ({len(rows_to_delete)} line items).")
                             st.rerun()
