@@ -1099,31 +1099,6 @@ with st.container(border=True):
         st.write(f"**Classification:** {group} > {sub_group}")
         st.info(f"**Unit Logic:** Purchased in {p_unit} | Sales tracked in {s_unit}")
 
-        costing_strategy = "Override with New Costing"
-        recent_purchase = None
-        
-        if not df_purchases.empty and selected_product in df_purchases['Material'].values:
-            item_history = df_purchases[df_purchases['Material'] == selected_product].copy()
-            item_history['Date'] = pd.to_datetime(item_history['Date'])
-            item_history = item_history.sort_values(by='Date')
-            recent_purchase = item_history.iloc[-1]
-            
-            days_since = (pd.to_datetime(purchase_date) - recent_purchase['Date']).days
-            
-            old_date = recent_purchase['Date'].strftime('%Y-%m-%d')
-            old_rate = float(recent_purchase.get('Rate_Purchase', 0))
-            old_landed = float(recent_purchase.get('Landed_Rate_Purchase', 0))
-            old_seller = str(recent_purchase.get('Seller', 'Unknown'))
-            
-            st.success(f"📜 **Last Purchase Details:** You bought this **{days_since} days ago** ({old_date}) from {old_seller}. \n\n **Old Base Rate:** {old_rate:,.2f} / {p_unit} &nbsp;&nbsp;|&nbsp;&nbsp; **Old Landed Rate:** {old_landed:,.2f} / {p_unit}")
-            
-            if 0 <= days_since <= 15:
-                st.warning(f"🕒 **High-Frequency Purchase:** Because this was bought within 15 days, you can choose to blend the inventory costs.")
-                costing_strategy = st.radio(
-                    "Price Fluctuation Strategy:",
-                    options=["Override with New Costing", "Weighted Average (Blend Old + New)"]
-                )
-
         i1, i2, i3 = st.columns(3)
         qty_p = i1.number_input(f"Total Quantity ({p_unit})", min_value=0.0, step=0.1)
         rate_p = i2.number_input(f"Purchase Rate (per {p_unit})", min_value=0.0)
@@ -1154,36 +1129,6 @@ with st.container(border=True):
             total_item_val = landed_rate_p * qty_p
             cost_per_s_unit = total_item_val / qty_s if qty_s > 0 else 0
 
-            # --- NEW: ISOLATE TODAY'S INVOICE FROM THE DATABASE MATH ---
-            supplier_qty = qty_p
-            supplier_total = total_item_val
-            old_qty_val = 0
-            old_total_val = 0
-            is_blended = "No"
-
-            if costing_strategy == "Weighted Average (Blend Old + New)" and recent_purchase is not None:
-                old_qty_val = float(recent_purchase.get('Qty_Purchase', 0))
-                old_qty_s = float(recent_purchase.get('Qty_Sales', 0))
-                old_total_val = float(recent_purchase.get('Total_Item_Cost', 0))
-                
-                new_qty_p = old_qty_val + qty_p
-                new_qty_s = old_qty_s + qty_s
-                new_total_cost = old_total_val + total_item_val
-                
-                landed_rate_p = new_total_cost / new_qty_p if new_qty_p > 0 else 0
-                cost_per_s_unit = new_total_cost / new_qty_s if new_qty_s > 0 else 0
-                
-                rate_p = round((float(recent_purchase.get('Rate_Purchase', 0)) + rate_p) / 2, 2)
-                excise = round((float(recent_purchase.get('Excise_Kg', 0)) + excise) / 2, 2)
-                trans = round((float(recent_purchase.get('Transport_Kg', 0)) + trans) / 2, 2)
-                labour = round((float(recent_purchase.get('Labour_Kg', 0)) + labour) / 2, 2)
-                
-                qty_p = new_qty_p
-                qty_s = new_qty_s
-                total_item_val = new_total_cost
-                is_blended = "Yes"
-                st.toast("✅ Applied Weighted Average pricing logic.")
-
             existing_item_index = None
             for i, item in enumerate(st.session_state.bill_items):
                 if item["Material"] == selected_product:
@@ -1209,12 +1154,6 @@ with st.container(border=True):
                 "Landed_Rate_Purchase": round(landed_rate_p, 2),
                 "Cost_Pc": round(cost_per_s_unit, 2),
                 "Total_Item_Cost": round(total_item_val, 2),
-                # Hidden Trackers for Review Screen
-                "Supplier_Qty": supplier_qty,
-                "Supplier_Total": round(supplier_total, 2),
-                "Old_Qty": old_qty_val,
-                "Old_Total": old_total_val,
-                "Is_Blended": is_blended
             }
 
             if existing_item_index is not None:
@@ -1231,33 +1170,49 @@ if st.session_state.bill_items:
     st.header("3. Bill Review")
     
     df_bill = pd.DataFrame(st.session_state.bill_items)
-    
-    # --- VISUAL BREAKDOWN FOR BLENDED ITEMS ---
-    blended_mask = df_bill['Is_Blended'] == 'Yes'
-    if blended_mask.any():
-        st.subheader("⚖️ 15-Day Blended Costing Breakdown")
-        st.info("You chose to blend these new purchases with your inventory from the last 15 days. The 'Database' column shows the new weighted average.")
-        
-        compare_df = df_bill[blended_mask]
-        for idx, row in compare_df.iterrows():
-            st.markdown(f"**{row['Material']}**")
-            b1, b2, b3 = st.columns(3)
-            b1.metric("Old Inventory (Last 15 Days)", f"{row['Old_Total']:,.2f}", f"{row['Old_Qty']} {row['Unit_Purchase']}")
-            b2.metric("Today's Invoice (New Addition)", f"{row['Supplier_Total']:,.2f}", f"{row['Supplier_Qty']} {row['Unit_Purchase']}")
-            b3.metric("Final Blended Value (Database)", f"{row['Total_Item_Cost']:,.2f}", f"{row['Qty_Purchase']} {row['Unit_Purchase']}")
-            st.write("---")
 
     # --- TODAY'S PHYSICAL INVOICE ---
     st.subheader("🧾 Today's Physical Invoice")
-    
-    # We display ONLY the 'Supplier' data here so the screen matches the paper bill exactly
-    invoice_df = df_bill[['Material', 'Supplier_Qty', 'Unit_Purchase', 'Supplier_Total']].copy()
+
+    invoice_df = df_bill[['Material', 'Qty_Purchase', 'Unit_Purchase', 'Total_Item_Cost']].copy()
     invoice_df.columns = ['Material', 'Qty Bought Today', 'Unit', 'Total Cost Today']
-    st.dataframe(invoice_df, hide_index=True)
-        
-    # Totals are calculated strictly on Today's money
-    total_bill_new_session = df_bill['Supplier_Total'].astype(float).sum()
-    deductions = (df_bill['Transport_Kg'].astype(float) + df_bill['Labour_Kg'].astype(float)) * df_bill['Supplier_Qty'].astype(float) * 1.13
+    invoice_df.insert(0, "Remove", False)
+
+    # A checkbox "Remove" column + explicit button, writing the removal
+    # straight back into st.session_state.bill_items immediately - not
+    # relying on num_rows="dynamic"'s built-in row deletion, which only
+    # lives in the widget's local return value and would silently
+    # reappear the next time this table gets rebuilt from session_state
+    # (e.g. after adding another item to the bill above).
+    edited_invoice = st.data_editor(
+        invoice_df,
+        column_config={
+            "Remove": st.column_config.CheckboxColumn(
+                "Remove", help="Check this row, then click 'Remove Selected Rows' below"
+            ),
+        },
+        disabled=[c for c in invoice_df.columns if c != "Remove"],
+        hide_index=True,
+        use_container_width=True,
+        key="bill_review_editor",
+    )
+
+    r_col, _ = st.columns([1, 3])
+    with r_col:
+        if st.button("🗑️ Remove Selected Rows", disabled=not edited_invoice["Remove"].any()):
+            keep_mask = ~edited_invoice["Remove"].values
+            st.session_state.bill_items = [
+                item for item, keep in zip(st.session_state.bill_items, keep_mask) if keep
+            ]
+            st.rerun()
+
+    # Save also respects any still-checked Remove boxes, so nothing
+    # checked-but-not-yet-cleared accidentally gets saved.
+    keep_mask_for_save = ~edited_invoice["Remove"].values
+    df_bill = df_bill[keep_mask_for_save].reset_index(drop=True)
+
+    total_bill_new_session = df_bill['Total_Item_Cost'].astype(float).sum()
+    deductions = (df_bill['Transport_Kg'].astype(float) + df_bill['Labour_Kg'].astype(float)) * df_bill['Qty_Purchase'].astype(float) * 1.13
     total_supplier_only = total_bill_new_session - deductions.sum()
     
     t1, t2 = st.columns(2)
@@ -1265,12 +1220,9 @@ if st.session_state.bill_items:
     t2.metric("Supplier Invoice (Excl. Transport/Labour)", f"{total_supplier_only:,.2f}")
 
     # --- FINAL SAVE LOGIC ---
-    if st.button("💾 Save Final Bill & Update Costings"):
+    if st.button("💾 Save Final Bill & Update Costings", disabled=df_bill.empty):
         try:
-            # 1. Clean up the dataframe to remove our hidden trackers
-            cols_to_drop = ['Supplier_Qty', 'Supplier_Total', 'Old_Qty', 'Old_Total', 'Is_Blended']
-            df_new_clean = df_bill.drop(columns=[col for col in cols_to_drop if col in df_bill.columns])
-            df_new_clean = df_new_clean.fillna("")
+            df_new_clean = df_bill.fillna("")
 
             # 2. Save each material as its own document update - prepends
             # this new costing to that material's history and trims to the
@@ -1317,7 +1269,7 @@ if st.session_state.bill_items:
 
             load_materials_costing.clear()
             clear_lazy_cache()
-            st.success("✅ Database updated! Blended costings were prioritized and saved.")
+            st.success("✅ Database updated! Costings saved.")
             st.balloons()
             st.session_state.bill_items = [] 
             st.rerun()
