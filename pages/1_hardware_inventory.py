@@ -159,6 +159,167 @@ def get_code_mapping():
     except Exception:
         return pd.DataFrame(columns=["Item Code", "Item Name", "Units"])
 
+def _next_fiscal_year_id(fy_doc_id):
+    """Given a fiscal year doc ID like 'FY 2082-83', returns the next one,
+    'FY 2083-84' - used to know which doc a closed year's balances roll
+    into. Returns None if fy_doc_id doesn't match the expected pattern
+    (e.g. 'FY Unknown')."""
+    m = _re.match(r"FY (\d{4})-\d{2}", str(fy_doc_id))
+    if not m:
+        return None
+    bs_year = int(m.group(1)) + 1
+    return f"FY {bs_year}-{str(bs_year + 1)[-2:]}"
+
+@st.cache_data(ttl=3600)
+def get_fy_stock_snapshot(fy):
+    """Reads ONE small document holding a fiscal year's opening/closing
+    stock for every item, as a pair of {item_name: qty} maps. This is the
+    entire cost of viewing a past year's stock, regardless of how many
+    items or transactions that year had - the alternative (summing every
+    transaction in that year on every view) is exactly what this avoids.
+    Returns {"opening": {}, "closing": {}, "closed": False} if the
+    snapshot doesn't exist yet (e.g. the very first fiscal year, before an
+    admin has entered its opening stock)."""
+    try:
+        db = st.session_state.db
+        snap = db.collection("fy_stock_snapshots").document(fy).get()
+        if snap.exists:
+            data = snap.to_dict()
+            return {
+                "opening": data.get("opening", {}) or {},
+                "closing": data.get("closing", {}) or {},
+                "closed": bool(data.get("closed", False)),
+            }
+    except Exception:
+        pass
+    return {"opening": {}, "closing": {}, "closed": False}
+
+def save_fy_opening_stock(fy, opening_dict):
+    """Admin-entered opening stock for a fiscal year - used for the very
+    first fiscal year on record, since every later year's opening is
+    derived automatically from the previous year's closing (see
+    close_fiscal_year below) rather than entered by hand. One targeted
+    doc write, regardless of how many items are in opening_dict."""
+    db = st.session_state.db
+    db.collection("fy_stock_snapshots").document(fy).set(
+        {"opening": opening_dict}, merge=True
+    )
+    get_fy_stock_snapshot.clear()
+
+def _compute_fy_closing(fy, opening):
+    """Shared by close_fiscal_year() and recalculate_fiscal_year(): reads
+    THIS fiscal year's transactions (one fiscal-year-scoped collection
+    read, via get_purchases(fy)) and adds their net movement on top of
+    the given opening balances. Always reads live - so if bills in this
+    FY were edited or deleted after it was first closed, calling this
+    again naturally picks up the correction."""
+    fy_purchases = get_purchases(fy)  # scoped to just this FY - see get_purchases()
+    closing = dict(opening)
+    if not fy_purchases.empty and 'Item_Name' in fy_purchases.columns and 'Stock Qty Added' in fy_purchases.columns:
+        work = fy_purchases.copy()
+        work['_qty'] = pd.to_numeric(work['Stock Qty Added'], errors='coerce').fillna(0)
+        net_by_item = work.groupby('Item_Name')['_qty'].sum()
+        for item_name, net_qty in net_by_item.items():
+            if not item_name or pd.isna(item_name):
+                continue
+            closing[item_name] = closing.get(item_name, 0) + float(net_qty)
+    return closing
+
+def close_fiscal_year(fy):
+    """Finalizes a fiscal year's closing stock and rolls it over to become
+    the next fiscal year's opening stock - one explicit admin action taken
+    once per year, not something recomputed on every page view.
+
+    Cost: exactly one collection read (that year's own transactions) plus
+    two small document writes (this year's closing, next year's opening).
+    Nothing here touches any other fiscal year's transactions or scans
+    the full multi-year history.
+
+    Returns (True, next_fy) on success, or (False, error_message)."""
+    try:
+        snapshot = get_fy_stock_snapshot(fy)
+        opening = dict(snapshot.get("opening", {}))
+        closing = _compute_fy_closing(fy, opening)
+
+        db = st.session_state.db
+        db.collection("fy_stock_snapshots").document(fy).set(
+            {"opening": opening, "closing": closing, "closed": True}, merge=True
+        )
+
+        next_fy = _next_fiscal_year_id(fy)
+        if next_fy:
+            db.collection("fy_stock_snapshots").document(next_fy).set(
+                {"opening": closing}, merge=True
+            )
+
+        get_fy_stock_snapshot.clear()
+        return True, next_fy
+    except Exception as e:
+        return False, str(e)
+
+def recalculate_fiscal_year(fy, cascade=True):
+    """Lets an admin correct a fiscal year's closing stock at any time
+    after it was first closed - e.g. an old bill in that year got edited
+    or deleted afterward, throwing off the closing balance that was
+    already rolled forward. Re-reads that year's CURRENT transactions
+    (get_purchases(fy) always reflects live data - any edit/delete
+    already clears its cache) and recomputes closing from the SAME
+    opening balance the year already has (opening itself doesn't change
+    here; only closing and what gets pushed forward).
+
+    Since a corrected closing changes the next year's opening, and that
+    next year may have ALSO already been closed on the old (now-wrong)
+    opening, cascade=True (the default) keeps walking forward and
+    recomputing every already-closed downstream year in turn, so the
+    whole chain stays consistent. A year that was never closed just gets
+    its opening silently corrected and the cascade stops there, since
+    there's nothing closed downstream yet to fix.
+
+    Cost: one collection read + one small doc write per year actually
+    touched - only this year, plus however many already-closed years
+    are downstream of it. Years that were never closed, and years before
+    the one being recalculated, are never read or written.
+
+    Returns (True, [list of fiscal years touched]) or (False, error)."""
+    try:
+        db = st.session_state.db
+        touched = []
+        current_fy = fy
+
+        while current_fy:
+            snapshot = get_fy_stock_snapshot(current_fy)
+            opening = dict(snapshot.get("opening", {}))
+            closing = _compute_fy_closing(current_fy, opening)
+
+            db.collection("fy_stock_snapshots").document(current_fy).set(
+                {"opening": opening, "closing": closing, "closed": True}, merge=True
+            )
+            touched.append(current_fy)
+
+            next_fy = _next_fiscal_year_id(current_fy)
+            if not next_fy:
+                break
+
+            next_snapshot = get_fy_stock_snapshot(next_fy)
+            was_next_already_closed = next_snapshot.get("closed", False)
+
+            # Always push the corrected closing forward as next year's
+            # opening, whether or not next year was closed yet.
+            db.collection("fy_stock_snapshots").document(next_fy).set(
+                {"opening": closing}, merge=True
+            )
+            get_fy_stock_snapshot.clear()
+
+            # Only keep recomputing forward if next year was ALSO already
+            # closed - otherwise its opening is now corrected and there's
+            # nothing further downstream to fix yet.
+            current_fy = next_fy if (cascade and was_next_already_closed) else None
+
+        get_fy_stock_snapshot.clear()
+        return True, touched
+    except Exception as e:
+        return False, str(e)
+
 @st.cache_data(ttl=3600)
 def get_learned_mappings():
     try:
@@ -1827,6 +1988,107 @@ with tab3:
                 inventory_summary = inventory_summary[inventory_summary['Item_Name'].isin(summary_items)]
 
             st.dataframe(inventory_summary, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("📅 Fiscal Year-wise Stock")
+            st.caption(
+                "Each year's closing stock automatically becomes the next year's opening stock. "
+                "Viewing a year costs a single small database read, no matter how many items or "
+                "transactions that year has."
+            )
+
+            fy_list_for_snapshot = get_fiscal_years()
+            if not fy_list_for_snapshot:
+                st.info("No fiscal years with recorded transactions yet.")
+            else:
+                fy_view_selected = st.selectbox(
+                    "Select fiscal year", options=fy_list_for_snapshot, index=0, key="fy_snapshot_select",
+                )
+                snapshot = get_fy_stock_snapshot(fy_view_selected)
+                is_latest_fy = fy_view_selected == fy_list_for_snapshot[0]
+
+                if not snapshot["opening"] and not snapshot["closed"]:
+                    st.warning(
+                        f"No opening stock is on record for {fy_view_selected} yet. "
+                        "If this is the very first fiscal year in the system, an admin needs to "
+                        "enter its opening stock manually below - every later year's opening is "
+                        "then derived automatically and won't need this."
+                    )
+                    if st.session_state.get("user_role") == "admin":
+                        with st.expander(f"✍️ Enter opening stock for {fy_view_selected}"):
+                            opening_items = st.multiselect(
+                                "Items to set opening stock for",
+                                options=products_df['Item_Name'].dropna().unique(),
+                                key="opening_stock_items",
+                            )
+                            opening_values = {}
+                            for it in opening_items:
+                                opening_values[it] = st.number_input(
+                                    f"Opening qty - {it}", value=0.0, step=1.0, key=f"opening_qty_{it}",
+                                )
+                            if st.button("💾 Save Opening Stock", disabled=not opening_items):
+                                save_fy_opening_stock(fy_view_selected, opening_values)
+                                st.success(f"✅ Opening stock saved for {fy_view_selected}.")
+                                st.rerun()
+                else:
+                    opening_df = pd.DataFrame(
+                        [{"Item_Name": k, "Opening Stock": v} for k, v in snapshot["opening"].items()]
+                    )
+
+                    if snapshot["closed"]:
+                        closing_df = pd.DataFrame(
+                            [{"Item_Name": k, "Closing Stock": v} for k, v in snapshot["closing"].items()]
+                        )
+                        combined = opening_df.merge(closing_df, on="Item_Name", how="outer").fillna(0)
+                        st.dataframe(combined.sort_values("Item_Name"), use_container_width=True, hide_index=True)
+
+                        if st.session_state.get("user_role") == "admin":
+                            with st.expander(f"🔄 Recalculate closing stock for {fy_view_selected}"):
+                                st.caption(
+                                    "Use this if a bill in this fiscal year was edited or deleted after "
+                                    "it was closed, and the closing stock no longer matches. This "
+                                    "re-reads this year's transactions and recomputes closing from the "
+                                    "same opening balance - only this year's data changes."
+                                )
+                                cascade_downstream = st.checkbox(
+                                    "Also recompute every later year that was already closed, so their "
+                                    "opening/closing balances stay consistent with this correction",
+                                    value=True, key=f"cascade_{fy_view_selected}",
+                                )
+                                confirm_recalc = st.checkbox(
+                                    f"I understand this will overwrite the recorded closing stock for {fy_view_selected}"
+                                    + (" and any already-closed years after it" if cascade_downstream else "") + ".",
+                                    key=f"confirm_recalc_{fy_view_selected}",
+                                )
+                                if st.button("🔄 Recalculate", disabled=not confirm_recalc):
+                                    ok, result = recalculate_fiscal_year(fy_view_selected, cascade=cascade_downstream)
+                                    if ok:
+                                        st.success(f"✅ Recalculated: {', '.join(result)}.")
+                                        st.rerun()
+                                    else:
+                                        st.error(f"Couldn't recalculate {fy_view_selected}: {result}")
+                    elif is_latest_fy:
+                        # Not yet closed - "closing so far" for the CURRENT year is just the
+                        # live stock_levels aggregate itself (already loaded above), since
+                        # that running total already reflects everything up to right now.
+                        # No extra reads needed for this - it's the same data already on screen.
+                        live_closing = stock_df.set_index("Item_Name")["Net_Qty"].to_dict() if "Item_Name" in stock_df.columns else {}
+                        combined = opening_df.copy()
+                        combined["Closing Stock (so far)"] = combined["Item_Name"].map(live_closing).fillna(0)
+                        st.dataframe(combined.sort_values("Item_Name"), use_container_width=True, hide_index=True)
+
+                        if st.session_state.get("user_role") == "admin":
+                            st.caption(f"When {fy_view_selected} ends, close it to lock in its closing stock and roll it over as next year's opening.")
+                            if st.button(f"🔒 Close {fy_view_selected} & Roll Over to Next Year"):
+                                ok, result = close_fiscal_year(fy_view_selected)
+                                if ok:
+                                    st.success(f"✅ {fy_view_selected} closed. Opening stock for {result} has been set.")
+                                    st.rerun()
+                                else:
+                                    st.error(f"Couldn't close {fy_view_selected}: {result}")
+                    else:
+                        st.dataframe(opening_df.sort_values("Item_Name"), use_container_width=True, hide_index=True)
+                        st.caption("This year hasn't been closed yet, so only its opening stock is available.")
 
             st.divider()
             st.subheader("Item Stock Ledger")
